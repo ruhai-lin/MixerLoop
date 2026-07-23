@@ -1,0 +1,70 @@
+[model]
+config = "configs/mixerloop_15m.json"
+tokenizer_path = "assets/tokenizer"
+
+[job]
+dump_folder = "exp"
+print_args = true
+
+[training]
+batch_size = 8
+seq_len = 1024
+context_len = 1024
+gradient_accumulation_steps = 64
+steps = 100000
+max_norm = 1.0
+skip_nan_inf = false
+data_parallel_replicate_degree = 1
+data_parallel_shard_degree = -1
+tensor_parallel_degree = 1
+compile = false
+dataset = "karpathy/climbmix-400b-shuffle"
+dataset_name = ""
+dataset_split = "train"
+data_dir = "data/climbmix-10b"
+num_workers = 0
+pin_memory = false
+persistent_workers = false
+prefetch_factor = 2
+seed = 1337
+varlen = false
+
+[optimizer]
+name = "AdamW"
+eps = 1e-8
+lr = 5e-4
+
+[lr_scheduler]
+warmup_steps = 1000
+decay_type = "cosine"
+lr_min = 0.0
+
+[checkpoint]
+enable_checkpoint = true
+folder = "checkpoint"
+interval_type = "steps"
+interval = 2000
+keep_latest_k = 2
+model_weights_only = false
+export_dtype = "float32"
+async_mode = "disabled"    # ["disabled", "async", "async_with_pinned_mem"]
+
+[profiling]
+enable_profiling = false
+save_traces_folder = "profile_trace"
+profile_freq = 512
+
+[metrics]
+log_freq = 20
+enable_wandb = false
+
+[experimental]
+context_parallel_degree = 1
+pipeline_parallel_degree = 1
+
+[float8]
+enable_fsdp_float8_all_gather = false
+precompute_float8_dynamic_scale_for_fsdp = false
+
+[activation_checkpoint]
+mode = "none"

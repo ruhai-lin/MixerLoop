@@ -1,0 +1,27 @@
+.venv/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.coverage
+.mypy_cache/
+.ruff_cache/
+
+data/
+outputs/
+core_bundle/
+wandb/
+runs/
+
+build/
+dist/
+
+# log and config files
+*.log
+*.part
+log.*
+*.log
+*.cfg
+*.ini
+*.yml
+*.yaml

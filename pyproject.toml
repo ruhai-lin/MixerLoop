@@ -1,0 +1,58 @@
+[project]
+name = "mixerloop"
+version = "0.1.0"
+description = "Selective recurrent-compute allocation for Gated Delta Networks"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [
+  { name = "Ruhai Lin" },
+]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+  "datasets==4.5.0",
+  "einops",
+  "flash-linear-attention[tilelang]==0.5.1",
+  "huggingface-hub",
+  "jinja2",
+  "ninja",
+  "numpy",
+  "pyarrow",
+  "pyyaml",
+  "requests",
+  "safetensors",
+  "sentencepiece>=0.2,<0.3",
+  "tensorboard",
+  "tiktoken",
+  "torch>=2.9",
+  "torchdata==0.11.0",
+  "torchtitan @ git+https://github.com/pytorch/torchtitan.git@0b44d4c",
+  "transformers==4.57.3",
+  "triton>=3.0",
+  "tqdm",
+  "wandb",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+eval = ["lm-eval>=0.4.9"]
+
+[project.urls]
+Homepage = "https://github.com/ruhai-lin/MixerLoop"
+Repository = "https://github.com/ruhai-lin/MixerLoop"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["flame*", "custom_models*"]
+
+[tool.isort]
+line_length = 119
+multi_line_output = 3
