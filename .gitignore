@@ -13,6 +13,10 @@ core_bundle/
 wandb/
 runs/
 
+# Paper sources and vector figures are versioned; ignore generated submission
+# binaries and TeX build state.
+paper/
+
 build/
 dist/
 

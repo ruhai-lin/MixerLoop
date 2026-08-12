@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Estimate ITR and per-step marginal ITR for MixerLoop checkpoints."""
+"""Finite, causal ITR monitoring at the language-model readout."""
 
 from __future__ import annotations
 
@@ -9,11 +9,13 @@ import json
 import os
 import random
 import sys
+from contextlib import nullcontext
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 RUN_ROOT = SCRIPT_DIR.parent
@@ -21,6 +23,13 @@ if str(RUN_ROOT) not in sys.path:
     sys.path.insert(0, str(RUN_ROOT))
 
 import custom_models  # noqa: E402,F401
+
+
+MODEL_LABELS = {
+    "gated_deltanet": "NoLoop",
+    "mixerloop": "MixerLoop",
+    "fullloop": "FullLoop",
+}
 
 
 def _active_indices(gram: torch.Tensor, relative_threshold: float) -> list[int]:
@@ -32,7 +41,7 @@ def _active_indices(gram: torch.Tensor, relative_threshold: float) -> list[int]:
 
 
 def effective_rank(gram: torch.Tensor, relative_threshold: float = 1e-6) -> float:
-    """Participation-ratio rank after unit-normalizing active operators."""
+    """Participation-ratio rank after unit-normalizing active trajectory vectors."""
     active = _active_indices(gram, relative_threshold)
     if not active:
         return 0.0
@@ -47,7 +56,7 @@ def marginal_itr(
     relative_threshold: float = 1e-6,
     pinv_rcond: float = 1e-8,
 ) -> list[float]:
-    """Novel energy of each increment after projection onto preceding increments."""
+    """Fraction of each finite readout increment outside preceding increments."""
     gram = 0.5 * (increment_gram.double() + increment_gram.double().T)
     active = set(_active_indices(gram, relative_threshold))
     values: list[float] = []
@@ -71,325 +80,547 @@ def marginal_itr(
     return values
 
 
-def gram_summary(
+def trajectory_summary(
     cumulative_gram: torch.Tensor,
     increment_gram: torch.Tensor,
     relative_threshold: float,
     pinv_rcond: float,
-) -> dict[str, object]:
+) -> dict[str, Any]:
     loops = cumulative_gram.shape[0]
     return {
-        'itr': effective_rank(cumulative_gram, relative_threshold),
-        'itr_by_depth': [
+        "itr": effective_rank(cumulative_gram, relative_threshold),
+        "itr_by_depth": [
             effective_rank(cumulative_gram[:depth, :depth], relative_threshold)
             for depth in range(1, loops + 1)
         ],
-        'marginal_itr': marginal_itr(increment_gram, relative_threshold, pinv_rcond),
-        'cumulative_active_depths': [
-            index + 1 for index in _active_indices(cumulative_gram, relative_threshold)
-        ],
-        'increment_active_depths': [
-            index + 1 for index in _active_indices(increment_gram, relative_threshold)
-        ],
-        'cumulative_gram': cumulative_gram.double().cpu().tolist(),
-        'increment_gram': increment_gram.double().cpu().tolist(),
+        "marginal_itr": marginal_itr(increment_gram, relative_threshold, pinv_rcond),
+        "cumulative_gram": cumulative_gram.double().cpu().tolist(),
+        "increment_gram": increment_gram.double().cpu().tolist(),
     }
 
 
-def load_windows(args, tokenizer) -> torch.Tensor:
-    required = args.num_windows * args.seq_len
-    if args.text_file:
-        text = Path(args.text_file).read_text(encoding='utf-8')
-        tokens = tokenizer.encode(text, add_special_tokens=False)
-        if len(tokens) < required:
-            raise ValueError(f'{args.text_file} has {len(tokens)} tokens; {required} required')
-        return torch.tensor(tokens[:required], dtype=torch.long).view(args.num_windows, args.seq_len)
-
+def load_windows(args: argparse.Namespace) -> torch.Tensor:
     data_dir = Path(args.data_dir).expanduser().resolve()
-    if args.dataset_split == 'validation':
-        shards = [data_dir / 'shard_06542.bin']
+    if args.dataset_split == "validation":
+        shards = [data_dir / "shard_06542.bin"]
     else:
-        shards = [data_dir / f'shard_{index:05d}.bin' for index in range(170)]
+        shards = [data_dir / f"shard_{index:05d}.bin" for index in range(170)]
     missing = [path for path in shards if not path.is_file()]
     if missing:
-        raise FileNotFoundError(f'ClimbMix data is incomplete; first missing shard: {missing[0]}')
+        raise FileNotFoundError(f"ClimbMix data is incomplete; first missing shard: {missing[0]}")
 
     rng = random.Random(args.data_seed)
     windows = []
     for _ in range(args.num_windows):
         shard = shards[rng.randrange(len(shards))]
-        tokens = np.memmap(shard, dtype=np.uint16, mode='r')
+        tokens = np.memmap(shard, dtype=np.uint16, mode="r")
         if len(tokens) < args.seq_len:
-            raise ValueError(f'{shard} has fewer than {args.seq_len} tokens')
+            raise ValueError(f"{shard} has fewer than {args.seq_len} tokens")
         start = rng.randrange(len(tokens) - args.seq_len + 1)
-        windows.append(torch.from_numpy(tokens[start:start + args.seq_len].astype(np.int64)))
+        windows.append(torch.from_numpy(tokens[start : start + args.seq_len].astype(np.int64)))
     return torch.stack(windows)
 
 
+def prediction_positions(seq_len: int, count: int) -> torch.Tensor:
+    if seq_len < 4:
+        raise ValueError("seq_len must be at least 4")
+    start = seq_len // 2
+    positions = torch.linspace(start, seq_len - 2, steps=count).round().long().unique()
+    if len(positions) != count:
+        raise ValueError(f"cannot select {count} unique prediction positions from seq_len={seq_len}")
+    return positions
+
+
+def layer_mixer(layer: torch.nn.Module) -> torch.nn.Module:
+    if hasattr(layer, "mixer"):
+        return layer.mixer
+    if hasattr(layer, "attn"):
+        return layer.attn
+    raise TypeError(f"{type(layer).__name__} has no supported token mixer")
+
+
+class ContextPrefix:
+    """Keep contextual mixing for a prefix of calls and isolate later calls by token."""
+
+    def __init__(self, mixer: torch.nn.Module, native_prefix: int):
+        self.mixer = mixer
+        self.native_prefix = native_prefix
+        self.calls = 0
+        self._inside_local_call = False
+        self._handle = None
+
+    @staticmethod
+    def _hidden_argument(args: tuple[Any, ...], kwargs: dict[str, Any]) -> torch.Tensor:
+        if args:
+            return args[0]
+        return kwargs["hidden_states"]
+
+    @staticmethod
+    def _first(output: Any) -> torch.Tensor:
+        return output[0] if isinstance(output, (tuple, list)) else output
+
+    @staticmethod
+    def _replace_first(output: Any, value: torch.Tensor) -> Any:
+        if isinstance(output, tuple):
+            return (value, *output[1:])
+        if isinstance(output, list):
+            return [value, *output[1:]]
+        return value
+
+    def _hook(
+        self,
+        module: torch.nn.Module,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        output: Any,
+    ) -> Any:
+        if self._inside_local_call:
+            return output
+        call_index = self.calls
+        self.calls += 1
+        if call_index < self.native_prefix:
+            return output
+
+        hidden = self._hidden_argument(args, kwargs)
+        if hidden.shape[0] != 1:
+            raise ValueError("causal ITR monitoring requires one window per forward")
+        isolated = hidden.reshape(-1, 1, hidden.shape[-1])
+        self._inside_local_call = True
+        try:
+            local_output = module(isolated, attention_mask=None)
+        finally:
+            self._inside_local_call = False
+        local_hidden = self._first(local_output).reshape_as(self._first(output))
+        return self._replace_first(output, local_hidden)
+
+    def __enter__(self) -> "ContextPrefix":
+        self._handle = self.mixer.register_forward_hook(self._hook, with_kwargs=True)
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self._handle.remove()
+
+
+def _autocast(device: torch.device):
+    if device.type == "cuda":
+        return torch.autocast("cuda", dtype=torch.bfloat16)
+    return nullcontext()
+
+
 @torch.no_grad()
-def layer_inputs(model, windows: torch.Tensor, layer_index: int, device: torch.device) -> list[torch.Tensor]:
-    base = model.model
-    states = []
-    for window in windows:
-        hidden = base.embeddings(window.unsqueeze(0).to(device))
-        for layer in base.layers[:layer_index]:
-            hidden = layer(hidden, residual_weight=base.residual_weight)
-        states.append(hidden.detach())
-    return states
-
-
-def covariance_geometry(
-    states: list[torch.Tensor],
+def readout_state(
+    model: torch.nn.Module,
+    window: torch.Tensor,
+    positions: torch.Tensor,
+    target_layer: int | None,
+    native_prefix: int | None,
     device: torch.device,
-    ridge: float,
-) -> tuple[torch.Tensor, torch.Tensor, dict[str, float | int]]:
-    rows = torch.cat([state.float().cpu().reshape(-1, state.shape[-1]) for state in states]).double()
-    rows -= rows.mean(dim=0, keepdim=True)
-    covariance = rows.T @ rows / max(rows.shape[0] - 1, 1)
-    eigenvalues, eigenvectors = torch.linalg.eigh(covariance)
-    raw_minimum = float(eigenvalues.min())
-    raw_maximum = float(eigenvalues.max())
-    floor = max(ridge * raw_maximum, torch.finfo(torch.float64).eps)
-    regularized = eigenvalues.clamp_min(floor)
-    covariance = eigenvectors @ regularized.diag() @ eigenvectors.T
-    inverse_sqrt = eigenvectors @ regularized.rsqrt().diag() @ eigenvectors.T
-    diagnostics = {
-        'samples': rows.shape[0],
-        'features': rows.shape[1],
-        'raw_minimum_eigenvalue': raw_minimum,
-        'raw_maximum_eigenvalue': raw_maximum,
-        'eigenvalue_floor': floor,
-        'regularized_condition_number': float(regularized.max() / regularized.min()),
-    }
-    return covariance.float().to(device), inverse_sqrt.float().to(device), diagnostics
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    inputs = window.unsqueeze(0).to(device)
+    if target_layer is None:
+        context = nullcontext()
+    else:
+        context = ContextPrefix(layer_mixer(model.model.layers[target_layer]), int(native_prefix))
+
+    with context as monitor, _autocast(device):
+        logits = model(input_ids=inputs).logits[0, positions.to(device)].float()
+    calls = 0 if target_layer is None else monitor.calls
+    probabilities = logits.softmax(dim=-1)
+    square_root_probabilities = probabilities.sqrt()
+    targets = inputs[0, positions.to(device) + 1]
+    target_log_probabilities = logits.log_softmax(dim=-1).gather(1, targets[:, None]).squeeze(1)
+    predictions = logits.argmax(dim=-1)
+    return square_root_probabilities, target_log_probabilities, predictions, calls
 
 
-def mixer_trajectory(layer, h0: torch.Tensor, residual_weight: torch.Tensor | None, loops: int):
-    states = []
-    hidden = h0
-    for loop_index in range(loops):
-        loop_input = hidden
-        update, _, _ = layer.mixer(layer.attn_norm(hidden))
-        hidden = hidden + update
-        if residual_weight is not None:
-            hidden = hidden + residual_weight[loop_index].view(1, 1, -1) * loop_input
-        states.append(hidden)
-    return states
-
-
-def metric_inner(left: torch.Tensor, right: torch.Tensor, covariance: torch.Tensor) -> torch.Tensor:
-    left = left.float().reshape(-1, left.shape[-1])
-    right = right.float().reshape(-1, right.shape[-1])
-    return torch.einsum('td,df,tf->', left, covariance, right)
-
-
-def relational_vjps(
-    states: list[torch.Tensor],
-    h0: torch.Tensor,
-    output_token: int,
-    output_vector: torch.Tensor,
-) -> list[torch.Tensor]:
-    vectors = []
-    for state in states:
-        probe = torch.zeros_like(state)
-        probe[:, output_token, :] = output_vector
-        sensitivity = torch.autograd.grad((state * probe).sum(), h0, retain_graph=True)[0]
-        sensitivity = sensitivity.clone()
-        sensitivity[:, output_token, :] = 0
-        vectors.append(sensitivity.detach())
-    return vectors
-
-
-def estimate_window(
-    layer,
-    h0_value: torch.Tensor,
-    residual_weight: torch.Tensor | None,
+@torch.no_grad()
+def evaluate_layer(
+    model: torch.nn.Module,
+    windows: torch.Tensor,
+    positions: torch.Tensor,
+    layer_index: int,
     loops: int,
-    covariance: torch.Tensor,
-    inverse_sqrt: torch.Tensor,
-    probes: int,
-    seed: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    h0 = h0_value.detach().requires_grad_(True)
-    states = mixer_trajectory(layer, h0, residual_weight, loops)
-    cumulative_gram = torch.zeros((loops, loops), dtype=torch.float64, device=h0.device)
+    device: torch.device,
+    relative_threshold: float,
+    pinv_rcond: float,
+) -> dict[str, Any]:
+    cumulative_gram = torch.zeros((loops, loops), dtype=torch.float64, device=device)
     increment_gram = torch.zeros_like(cumulative_gram)
-    generator = torch.Generator(device=h0.device).manual_seed(seed)
+    step_hellinger = torch.zeros(loops, dtype=torch.float64, device=device)
+    cumulative_hellinger = torch.zeros_like(step_hellinger)
+    target_logprob_gain = torch.zeros_like(step_hellinger)
+    top1_flip_rate = torch.zeros_like(step_hellinger)
+    native_nll = 0.0
+    context_off_nll = 0.0
+    native_hook_error = 0.0
 
-    for _ in range(probes):
-        output_token = int(torch.randint(h0.shape[1], (1,), generator=generator, device=h0.device))
-        signs = torch.randint(0, 2, (h0.shape[-1],), generator=generator, device=h0.device)
-        with torch.autocast(device_type=h0.device.type, enabled=False):
-            output_vector = inverse_sqrt @ (2 * signs - 1).float()
-        cumulative = relational_vjps(states, h0, output_token, output_vector.to(h0.dtype))
-        increments = [cumulative[0]] + [
-            cumulative[index] - cumulative[index - 1] for index in range(1, loops)
-        ]
-        for row in range(loops):
-            for column in range(row, loops):
-                cumulative_value = metric_inner(cumulative[row], cumulative[column], covariance)
-                increment_value = metric_inner(increments[row], increments[column], covariance)
-                cumulative_gram[row, column] += cumulative_value
-                increment_gram[row, column] += increment_value
-                if row != column:
-                    cumulative_gram[column, row] += cumulative_value
-                    increment_gram[column, row] += increment_value
+    for window_index, window in enumerate(windows):
+        readouts = []
+        log_probabilities = []
+        predictions = []
+        for prefix in range(loops + 1):
+            readout, logp, predicted, calls = readout_state(
+                model,
+                window,
+                positions,
+                layer_index,
+                prefix,
+                device,
+            )
+            if calls != loops:
+                raise RuntimeError(
+                    f"layer {layer_index}: expected {loops} mixer calls, observed {calls}"
+                )
+            readouts.append(readout)
+            log_probabilities.append(logp)
+            predictions.append(predicted)
 
-    return cumulative_gram / probes, increment_gram / probes
+        trajectory = torch.stack(readouts)
+        logp = torch.stack(log_probabilities)
+        predicted = torch.stack(predictions)
+        cumulative = trajectory[1:] - trajectory[:1]
+        increments = trajectory[1:] - trajectory[:-1]
+        cumulative_gram += torch.einsum("rpd,spd->rs", cumulative, cumulative).double()
+        increment_gram += torch.einsum("rpd,spd->rs", increments, increments).double()
+        step_hellinger += 0.5 * increments.square().sum(dim=-1).mean(dim=-1).double()
+        cumulative_hellinger += 0.5 * cumulative.square().sum(dim=-1).mean(dim=-1).double()
+        target_logprob_gain += (logp[1:] - logp[:-1]).mean(dim=-1).double()
+        top1_flip_rate += (predicted[1:] != predicted[:-1]).float().mean(dim=-1).double()
+        native_nll -= float(logp[-1].mean())
+        context_off_nll -= float(logp[0].mean())
+
+        if window_index == 0:
+            raw, _, _, _ = readout_state(model, window, positions, None, None, device)
+            native_hook_error = float((raw - trajectory[-1]).abs().max())
+
+    count = len(windows)
+    summary = trajectory_summary(
+        cumulative_gram / count,
+        increment_gram / count,
+        relative_threshold,
+        pinv_rcond,
+    )
+    summary.update(
+        {
+            "layer": layer_index,
+            "step_hellinger_squared": (step_hellinger / count).cpu().tolist(),
+            "cumulative_hellinger_squared": (cumulative_hellinger / count).cpu().tolist(),
+            "target_logprob_gain": (target_logprob_gain / count).cpu().tolist(),
+            "top1_flip_rate": (top1_flip_rate / count).cpu().tolist(),
+            "native_nll": native_nll / count,
+            "context_off_nll": context_off_nll / count,
+            "native_context_nll_gain": (context_off_nll - native_nll) / count,
+            "native_hook_max_abs_error": native_hook_error,
+        }
+    )
+    return summary
 
 
-def write_results(out_dir: Path, result: dict[str, object]) -> None:
+def evaluate_model(
+    model_path: str,
+    windows: torch.Tensor,
+    positions: torch.Tensor,
+    layers: list[int] | None,
+    args: argparse.Namespace,
+    device: torch.device,
+) -> dict[str, Any]:
+    model = AutoModelForCausalLM.from_pretrained(model_path, dtype=torch.float32).to(device)
+    model.eval()
+    model_type = model.config.model_type
+    if model_type not in MODEL_LABELS:
+        raise ValueError(f"expected one of {sorted(MODEL_LABELS)}, got {model_type}")
+    loops = int(getattr(model.config, "loop_count", 1))
+    selected_layers = layers or list(range(len(model.model.layers)))
+    if any(index < 0 or index >= len(model.model.layers) for index in selected_layers):
+        raise ValueError(f"invalid layer selection {selected_layers}")
+
+    layer_results = []
+    for layer_index in selected_layers:
+        result = evaluate_layer(
+            model,
+            windows,
+            positions,
+            layer_index,
+            loops,
+            device,
+            args.relative_threshold,
+            args.pinv_rcond,
+        )
+        layer_results.append(result)
+        print(
+            f"[itr] {MODEL_LABELS[model_type]} layer={layer_index} "
+            f"ITR={result['itr']:.3f} "
+            f"mITR={[round(value, 3) for value in result['marginal_itr']]} "
+            f"context-NLL-gain={result['native_context_nll_gain']:+.4f}",
+            flush=True,
+        )
+
+    cumulative_gram = torch.tensor(
+        np.mean([result["cumulative_gram"] for result in layer_results], axis=0)
+    )
+    increment_gram = torch.tensor(
+        np.mean([result["increment_gram"] for result in layer_results], axis=0)
+    )
+    aggregate = trajectory_summary(
+        cumulative_gram,
+        increment_gram,
+        args.relative_threshold,
+        args.pinv_rcond,
+    )
+    for key in (
+        "step_hellinger_squared",
+        "cumulative_hellinger_squared",
+        "target_logprob_gain",
+        "top1_flip_rate",
+    ):
+        aggregate[key] = np.mean([result[key] for result in layer_results], axis=0).tolist()
+    aggregate["native_context_nll_gain"] = float(
+        np.mean([result["native_context_nll_gain"] for result in layer_results])
+    )
+    step_effects = aggregate["step_hellinger_squared"]
+    aggregate["later_pass_effect_fraction"] = (
+        float(sum(step_effects[1:]) / sum(step_effects)) if sum(step_effects) else 0.0
+    )
+    aggregate["later_pass_target_logprob_gain"] = float(
+        sum(aggregate["target_logprob_gain"][1:])
+    )
+    aggregate["native_hook_max_abs_error"] = max(
+        result["native_hook_max_abs_error"] for result in layer_results
+    )
+
+    del model
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    return {
+        "model_path": os.path.abspath(model_path),
+        "model_type": model_type,
+        "label": MODEL_LABELS[model_type],
+        "loop_count": loops,
+        "layers": selected_layers,
+        "aggregate": aggregate,
+        "layer_results": layer_results,
+    }
+
+
+def write_results(out_dir: Path, result: dict[str, Any]) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
-    with (out_dir / 'itr_eval.json').open('w', encoding='utf-8') as handle:
+    with (out_dir / "itr_eval.json").open("w", encoding="utf-8") as handle:
         json.dump(result, handle, indent=2)
 
     rows = []
-    for record in result['replicates']:
-        for depth, (itr, mitr) in enumerate(
-            zip(record['itr_by_depth'], record['marginal_itr']), start=1
-        ):
-            rows.append(
-                {
-                    'window': record['window'],
-                    'probe_seed': record['probe_seed'],
-                    'depth': depth,
-                    'itr': itr,
-                    'marginal_itr': mitr,
-                }
-            )
-    with (out_dir / 'itr_eval.csv').open('w', encoding='utf-8', newline='') as handle:
+    for model in result["models"]:
+        for layer in model["layer_results"]:
+            for pass_index in range(model["loop_count"]):
+                rows.append(
+                    {
+                        "model": model["label"],
+                        "layer": layer["layer"],
+                        "pass": pass_index + 1,
+                        "itr_at_depth": layer["itr_by_depth"][pass_index],
+                        "marginal_itr": layer["marginal_itr"][pass_index],
+                        "step_hellinger_squared": layer["step_hellinger_squared"][pass_index],
+                        "cumulative_hellinger_squared": layer["cumulative_hellinger_squared"][
+                            pass_index
+                        ],
+                        "target_logprob_gain": layer["target_logprob_gain"][pass_index],
+                        "top1_flip_rate": layer["top1_flip_rate"][pass_index],
+                    }
+                )
+    with (out_dir / "itr_events.csv").open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=rows[0].keys())
         writer.writeheader()
         writer.writerows(rows)
 
-    aggregate = result['aggregate']
-    with (out_dir / 'itr_eval.md').open('w', encoding='utf-8') as handle:
-        handle.write('# Iterative Transport Evaluation\n\n')
-        handle.write(f"Model: `{result['model_path']}`  \n")
-        handle.write(f"Layer: {result['layer']}  \n")
-        handle.write(f"ITR: {aggregate['itr']:.4f}  \n")
+    with (out_dir / "itr_eval.md").open("w", encoding="utf-8") as handle:
+        handle.write("# Causal Readout ITR\n\n")
         handle.write(
-            'Marginal ITR: '
-            + ', '.join(f'{value:.4f}' for value in aggregate['marginal_itr'])
-            + '\n'
+            "Each prefix restores contextual mixer computation while retaining "
+            "token-isolated local computation at later passes.\n\n"
         )
+        handle.write(
+            "| Model | ITR | mITR | Later effect | Later $\\Delta\\log p$ | "
+            "Context NLL gain |\n"
+        )
+        handle.write("|---|---:|---|---:|---:|---:|\n")
+        for model in result["models"]:
+            aggregate = model["aggregate"]
+            mitr = ", ".join(f"{value:.3f}" for value in aggregate["marginal_itr"])
+            handle.write(
+                f"| {model['label']} | {aggregate['itr']:.3f} | {mitr} | "
+                f"{aggregate['later_pass_effect_fraction']:.1%} | "
+                f"{aggregate['later_pass_target_logprob_gain']:+.3f} | "
+                f"{aggregate['native_context_nll_gain']:+.4f} |\n"
+            )
+
+
+def plot_results(out_dir: Path, result: dict[str, Any]) -> None:
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import TwoSlopeNorm
+
+    models = result["models"]
+    max_loops = max(model["loop_count"] for model in models)
+    metrics = (
+        ("marginal_itr", "Marginal ITR", "viridis", 0.0, 1.0),
+        (
+            "step_hellinger_squared",
+            r"Prediction effect ($H^2$)",
+            "magma",
+            0.0,
+            max(
+                max(layer["step_hellinger_squared"])
+                for model in models
+                for layer in model["layer_results"]
+            ),
+        ),
+    )
+    gain_limit = max(
+        abs(value)
+        for model in models
+        for layer in model["layer_results"]
+        for value in layer["target_logprob_gain"]
+    )
+
+    fig, axes = plt.subplots(
+        3,
+        len(models),
+        figsize=(7.0, 6.0),
+        constrained_layout=True,
+        squeeze=False,
+    )
+    for column, model in enumerate(models):
+        layers = model["layers"]
+        for row, (key, label, cmap, lower, upper) in enumerate(metrics):
+            matrix = np.full((len(layers), max_loops), np.nan)
+            for layer_row, layer in enumerate(model["layer_results"]):
+                matrix[layer_row, : model["loop_count"]] = layer[key]
+            image = axes[row, column].imshow(
+                matrix,
+                aspect="auto",
+                origin="lower",
+                cmap=cmap,
+                vmin=lower,
+                vmax=upper,
+            )
+            if column == len(models) - 1:
+                fig.colorbar(image, ax=axes[row, :], shrink=0.8, pad=0.02)
+            axes[row, column].set_title(model["label"] if row == 0 else "")
+            axes[row, column].set_yticks(range(len(layers)), labels=layers)
+            axes[row, column].set_xticks(range(max_loops), labels=range(1, max_loops + 1))
+            if column == 0:
+                axes[row, column].set_ylabel(f"{label}\nLayer")
+
+        gain = np.full((len(layers), max_loops), np.nan)
+        for layer_row, layer in enumerate(model["layer_results"]):
+            gain[layer_row, : model["loop_count"]] = layer["target_logprob_gain"]
+        image = axes[2, column].imshow(
+            gain,
+            aspect="auto",
+            origin="lower",
+            cmap="coolwarm",
+            norm=TwoSlopeNorm(vmin=-gain_limit, vcenter=0.0, vmax=gain_limit),
+        )
+        if column == len(models) - 1:
+            fig.colorbar(image, ax=axes[2, :], shrink=0.8, pad=0.02)
+        axes[2, column].set_yticks(range(len(layers)), labels=layers)
+        axes[2, column].set_xticks(range(max_loops), labels=range(1, max_loops + 1))
+        axes[2, column].set_xlabel("Contextual mixer pass")
+        if column == 0:
+            axes[2, column].set_ylabel("True-token $\\Delta\\log p$\nLayer")
+
+    for suffix in ("pdf", "png"):
+        fig.savefig(out_dir / f"itr_heatmaps.{suffix}", dpi=300)
+    plt.close(fig)
+
+    colors = {"NoLoop": "#777777", "MixerLoop": "#2574A9", "FullLoop": "#D35400"}
+    fig, axes = plt.subplots(1, 3, figsize=(7.0, 2.45), constrained_layout=True)
+    for model in models:
+        aggregate = model["aggregate"]
+        passes = np.arange(1, model["loop_count"] + 1)
+        for axis, key in zip(
+            axes,
+            ("itr_by_depth", "step_hellinger_squared", "target_logprob_gain"),
+        ):
+            axis.plot(
+                passes,
+                aggregate[key],
+                marker="o",
+                color=colors[model["label"]],
+                label=model["label"],
+            )
+    axes[0].set_ylabel("Readout ITR")
+    axes[0].set_title("Cumulative directions")
+    axes[1].set_ylabel(r"Prediction effect ($H^2$)")
+    axes[1].set_title("Finite output change")
+    axes[2].axhline(0, color="#888888", linewidth=0.8)
+    axes[2].set_ylabel(r"True-token $\Delta\log p$")
+    axes[2].set_title("Task contribution")
+    for axis in axes:
+        axis.set_xticks(range(1, max_loops + 1))
+        axis.set_xlabel("Contextual pass")
+        axis.title.set_fontsize(10)
+        axis.xaxis.label.set_fontsize(9)
+        axis.yaxis.label.set_fontsize(9)
+        axis.tick_params(labelsize=8)
+    axes[0].legend(
+        frameon=False,
+        fontsize=7,
+        loc="upper left",
+    )
+    for suffix in ("pdf", "png"):
+        fig.savefig(out_dir / f"itr_summary.{suffix}", dpi=300)
+    plt.close(fig)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--model_path', required=True)
-    parser.add_argument('--tokenizer_path', default=None)
-    parser.add_argument('--out_dir', default=None)
-    parser.add_argument('--layer', type=int, default=-1)
-    parser.add_argument('--seq_len', type=int, default=128)
-    parser.add_argument('--num_windows', type=int, default=8)
-    parser.add_argument('--probes', type=int, default=16)
-    parser.add_argument('--probe_seeds', type=int, default=2)
-    parser.add_argument('--relative_threshold', type=float, default=1e-6)
-    parser.add_argument('--pinv_rcond', type=float, default=1e-8)
-    parser.add_argument('--covariance_ridge', type=float, default=1e-5)
-    parser.add_argument('--data_dir', default='data/climbmix-10b')
-    parser.add_argument('--dataset_split', choices=['train', 'validation'], default='validation')
-    parser.add_argument('--data_seed', type=int, default=2027)
-    parser.add_argument('--text_file', default=None)
-    parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
+    parser.add_argument("--model_paths", nargs="+", required=True)
+    parser.add_argument("--out_dir", required=True)
+    parser.add_argument("--layers", nargs="+", type=int, default=None)
+    parser.add_argument("--seq_len", type=int, default=128)
+    parser.add_argument("--num_windows", type=int, default=8)
+    parser.add_argument("--prediction_positions", type=int, default=16)
+    parser.add_argument("--relative_threshold", type=float, default=1e-6)
+    parser.add_argument("--pinv_rcond", type=float, default=1e-8)
+    parser.add_argument("--data_dir", default="data/climbmix-10b")
+    parser.add_argument("--dataset_split", choices=["train", "validation"], default="validation")
+    parser.add_argument("--data_seed", type=int, default=2027)
+    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
+    if args.num_windows < 1 or args.prediction_positions < 1:
+        raise ValueError("num_windows and prediction_positions must be positive")
     device = torch.device(args.device)
-    tokenizer_path = args.tokenizer_path or args.model_path
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_path,
-        dtype=torch.bfloat16 if device.type == 'cuda' else torch.float32,
-    ).to(device)
-    model.eval()
-
-    if model.config.model_type != 'mixerloop':
-        raise ValueError(
-            f'ITR trajectory extraction requires MixerLoop, got {model.config.model_type}'
-        )
-    base = model.model
-    layer_index = args.layer if args.layer >= 0 else len(base.layers) + args.layer
-    if not 0 <= layer_index < len(base.layers):
-        raise ValueError(f'layer {args.layer} resolves to invalid index {layer_index}')
-    loops = int(model.config.loop_count)
-    # FLA switches eval-mode sequences of length <=64 to a fused recurrent
-    # kernel whose backward pass is intentionally unavailable. ITR needs VJPs,
-    # so force the target mixer onto its training-mode chunk kernel. There is no
-    # dropout or parameter update in this evaluation.
-    base.layers[layer_index].mixer.train()
-
-    windows = load_windows(args, tokenizer)
-    inputs = layer_inputs(model, windows, layer_index, device)
-    covariance, inverse_sqrt, covariance_info = covariance_geometry(
-        inputs, device, args.covariance_ridge
-    )
-
-    cumulative_total = torch.zeros((loops, loops), dtype=torch.float64, device=device)
-    increment_total = torch.zeros_like(cumulative_total)
-    replicates = []
-    for window_index, hidden in enumerate(inputs):
-        for probe_seed in range(args.probe_seeds):
-            seed = 1009 * args.data_seed + 9176 * window_index + probe_seed
-            cumulative, increment = estimate_window(
-                base.layers[layer_index],
-                hidden,
-                base.residual_weight,
-                loops,
-                covariance,
-                inverse_sqrt,
-                args.probes,
-                seed,
-            )
-            cumulative_total += cumulative
-            increment_total += increment
-            summary = gram_summary(
-                cumulative,
-                increment,
-                args.relative_threshold,
-                args.pinv_rcond,
-            )
-            summary.update({'window': window_index, 'probe_seed': probe_seed})
-            replicates.append(summary)
-            print(
-                f"[itr] window={window_index} seed={probe_seed} "
-                f"ITR={summary['itr']:.4f} mITR={summary['marginal_itr']}"
-            )
-
-    count = args.num_windows * args.probe_seeds
-    aggregate = gram_summary(
-        cumulative_total / count,
-        increment_total / count,
-        args.relative_threshold,
-        args.pinv_rcond,
-    )
-    replicate_itr = np.asarray([record['itr'] for record in replicates], dtype=float)
-    replicate_mitr = np.asarray([record['marginal_itr'] for record in replicates], dtype=float)
-    aggregate['replicate_itr_mean'] = float(replicate_itr.mean())
-    aggregate['replicate_itr_std'] = float(replicate_itr.std(ddof=1)) if len(replicates) > 1 else 0.0
-    aggregate['replicate_marginal_itr_mean'] = replicate_mitr.mean(axis=0).tolist()
-    aggregate['replicate_marginal_itr_std'] = (
-        replicate_mitr.std(axis=0, ddof=1).tolist() if len(replicates) > 1 else [0.0] * loops
-    )
-
+    windows = load_windows(args)
+    positions = prediction_positions(args.seq_len, args.prediction_positions)
+    models = [
+        evaluate_model(path, windows, positions, args.layers, args, device)
+        for path in args.model_paths
+    ]
     result = {
-        'model_path': os.path.abspath(args.model_path),
-        'model_type': model.config.model_type,
-        'layer': layer_index,
-        'loop_count': loops,
-        'seq_len': args.seq_len,
-        'num_windows': args.num_windows,
-        'probes_per_seed': args.probes,
-        'probe_seeds': args.probe_seeds,
-        'data_seed': args.data_seed,
-        'covariance': covariance_info,
-        'aggregate': aggregate,
-        'replicates': replicates,
+        "definition": {
+            "context_off": (
+                "Apply the same mixer independently to every token, resetting "
+                "convolution and recurrent state between tokens."
+            ),
+            "trajectory": (
+                "Enable contextual mixer calls in prefix order and measure finite "
+                "changes in sqrt(next-token probability) at the final readout."
+            ),
+            "step_effect": "Squared Hellinger distance between consecutive prefix policies.",
+            "task_effect": "Change in ground-truth next-token log probability.",
+        },
+        "seq_len": args.seq_len,
+        "num_windows": args.num_windows,
+        "prediction_positions": positions.tolist(),
+        "dataset_split": args.dataset_split,
+        "data_seed": args.data_seed,
+        "models": models,
     }
-    out_dir = Path(args.out_dir) if args.out_dir else Path(args.model_path) / 'itr_eval'
+    out_dir = Path(args.out_dir)
     write_results(out_dir, result)
-    print(f'[itr] wrote {out_dir / "itr_eval.json"}')
+    plot_results(out_dir, result)
+    print(f"[itr] wrote {out_dir / 'itr_eval.json'}")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

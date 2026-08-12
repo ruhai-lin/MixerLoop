@@ -143,13 +143,33 @@ python eval/harness_eval.py \
   --out_dir outputs/mixerloop-15m/eval/harness
 ```
 
-ITR is defined for MixerLoop's repeated mixer trajectory:
+The causal readout ITR monitor compares NoLoop, MixerLoop, and FullLoop on the
+same held-out windows. It disables cross-token computation while retaining the
+same mixer's token-local computation, then restores contextual mixer passes in
+prefix order:
 
 ```bash
 python eval/itr_eval.py \
-  --model_path outputs/mixerloop-15m \
+  --model_paths \
+    outputs/gdn-15m \
+    outputs/mixerloop-15m \
+    outputs/fullloop-15m \
   --data_dir data/climbmix-10b \
-  --out_dir outputs/mixerloop-15m/eval/itr
+  --out_dir outputs/itr-readout-15m
+```
+
+The evaluator reports finite probability-space ITR/marginal ITR, squared
+Hellinger effect, signed ground-truth log-probability gain, and layer-by-pass
+heatmaps. It does not use input gradients or Jacobian sensitivity as a proxy for
+task value.
+
+The paper's synchronized BF16 prefill protocol is also executable directly:
+
+```bash
+python eval/throughput_eval.py \
+  --model_paths outputs/mixerloop-15m outputs/fullloop-15m \
+  --batch_size 32 \
+  --out_file outputs/throughput-15m-batch32.json
 ```
 
 Published results are:
