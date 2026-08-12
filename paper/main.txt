@@ -1,0 +1,310 @@
+              What Should Loop? Mixer-Only Recurrence in Language Models
+
+                                                       Anonymous submission
+
+
+
+
+                             Abstract                                   which operator produces the gain or how recurrent compute
+                                                                        should be distributed within a block.
+  Looped language models improve reasoning and knowledge
+  manipulation by applying shared computation repeatedly. Ex-
+                                                                           SGT provides an important operator-level result: selected
+  isting systems usually repeat an entire layer stack, although a       softmax attention heads can be looped while the FFN is ap-
+  mixer and a dense feed-forward network (FFN) perform dif-             plied once (Chen et al. 2026b). Yet its selection criterion is
+  ferent operations and have different costs. We ask a narrower         the entropy of a one-step attention distribution. This crite-
+  question: what should loop? We view recurrence as repeated            rion does not directly extend to a stateful linear mixer, where
+  composition of a state update and argue that an application           the same parameters can produce a different memory up-
+  is valuable when it exposes a new cross-position influence            date at every recurrent application. LT2 shows that Gated
+  direction that remains observable at the task readout. Iterative      DeltaNet (GDN) and other efficient mixers benefit from full-
+  Transport Rank (ITR) describes the cumulative influence tra-          stack looping, but leaves open why repeated mixing helps
+  jectory; marginal ITR describes the nonredundant influence            and whether the accompanying dense FFNs must also be
+  contributed by successive applications. This view motivates
+  MixerLoop, which repeats each Gated DeltaNet mixer while
+                                                                        repeated.
+  applying its dense FFN once. We compare MixerLoop with                   We organize this question as a short chain of require-
+  no recurrence and full-stack recurrence at 15M and 110M               ments. A loop is repeated composition of a state update.
+  parameters under matched data and training budgets. A finite          An additional composition matters only if it exposes an in-
+  intervention restores contextual mixer passes one at a time           fluence not already expressed by earlier compositions. That
+  from a token-isolated counterfactual and measures their ef-           influence must survive the remaining network and change
+  fect on the final next-token distribution. MixerLoop improves         the task readout. Recurrence should stop when the marginal
+  CORE at both scales, outperforming full recurrence at 15M             effect becomes redundant or unobservable, and additional
+  and retaining 42% of its gain at 110M while using 54% of              compute should be allocated to the operator that produces
+  its recurrent-block projection FLOPs. Later mixer passes ac-          the most observable effect per unit cost. This distinction is
+  count for 47–54% of its finite output change and increase the
+  true-token probability at both scales. The benefits of recurrent
+                                                                        important: hidden states can move in many directions with-
+  depth can therefore be retained without repeatedly executing          out changing the model’s prediction, and a large sensitivity
+  the dense FFN.                                                        need not improve the correct answer.
+                                                                           We instantiate this view in MixerLoop, shown in Fig-
+                                                                        ure 1. Within each physical layer, the GDN mixer is applied
+                         Introduction                                   four times and the dense FFN once. We compare it with a
+Weight-shared recurrence has become an increasingly ef-                 standard non-recurrent GDN and LT2-style full-stack recur-
+fective way to scale the computational depth of language                rence using the same dimensions, tokenizer, corpus, opti-
+models without increasing their number of unique param-                 mizer, and 52.4B-token training budget. We then introduce
+eters. Looped Transformers, from Universal Transformers                 a finite, causal readout version of Iterative Transport Rank
+to recent models such as Ouro and LT2, repeatedly apply                 (ITR). For one layer at a time, we remove only cross-token
+the same layers before producing the final token prediction             mixer computation, restore recurrent passes in execution or-
+(Dehghani et al. 2019; Zhu et al. 2026; Deng et al. 2026).              der, and observe the resulting trajectory in the final predic-
+This gives a fixed set of parameters multiple rounds of latent          tive distribution. ITR measures the diversity accumulated by
+computation. Most systems, however, define recurrence at                this trajectory; marginal ITR measures what each pass adds
+the block or stack level: the token mixer and feed-forward              beyond previous passes. Prediction distance and the ground-
+network are repeated together. Their success establishes that           truth log-probability change separately establish that the new
+additional latent computation is useful, but does not reveal            direction has non-negligible magnitude and task value.
+                                                                           The results support a selective allocation of recurrent com-
+This is an anonymized submission for review purposes only. Dis-         pute. MixerLoop improves the aggregate CORE score over
+tribution, citation, or public sharing of this manuscript is strictly   the non-recurrent model at both 15M and 110M parameters.
+prohibited. Copyright and publication details will appear in the
+final version if accepted.
+                                                                        It dominates full recurrence at 15M; at 110M, the full model
+obtains the highest raw score, while MixerLoop remains                                       Method
+on the capability–compute frontier with 46% less recurrent-        Allocating Recurrent Compute
+block projection compute. At both scales, passes two through
+four create nonredundant changes in the final distribution and     Let one physical layer contain a residual GDN mixer and a
+jointly increase the log probability of the observed next token.   residual dense FFN:
+A randomly initialized control produces neither a comparable                   Ai (h) = h + GDNi (NormA,i (h)) ,               (1)
+readout trajectory nor a positive task contribution. Together,
+                                                                               Fi (h) = h + FFNi (NormF,i (h)) ,               (2)
+the architecture and intervention show that repeated dense
+transformation is not required for useful recurrent transport.     and let Bi = Fi ◦ Ai . A non-recurrent GDN executes
+                                                                                 hNoLoop = (BL ◦ · · · ◦ B1 )(h0 ).            (3)
+                      Related Work
+Looped language models. Universal Transformers intro-              Our FullLoop baseline follows LT2 and repeats the complete
+duced depth-wise recurrence with shared parameters (De-            physical stack:
+hghani et al. 2019). Subsequent analyses connect looping
+                                                                                hFullLoop = (BL ◦ · · · ◦ B1 )T (h0 ).         (4)
+to iterative algorithms, latent thoughts, and length gener-
+alization (Yang et al. 2024; Saunshi et al. 2025). Modern          MixerLoop instead places recurrence inside each layer:
+recurrent-depth language models bring the same idea to pre-
+training. Huginn increases latent computation at test time,            hMixerLoop = (FL ◦ ATL ) ◦ · · · ◦ (F1 ◦ AT1 )(h0 ).    (5)
+while Ouro scales a recurrent backbone to large data regimes       Mixer parameters are shared across the T applications, while
+and finds that its gains are concentrated in knowledge ma-         physical layers retain distinct parameters. The three models
+nipulation rather than raw storage (Geiping et al. 2025; Zhu       therefore have effectively equal unique parameter counts but
+et al. 2026). LT2 replaces quadratic attention with linear and     execute (1, 1), (T, 1), and (T, T ) mixer–FFN applications
+sparse mixers, showing that looping can iteratively refine a       per physical layer.
+compact memory or expand a sparse receptive field (Deng               This boundary is motivated by function, not by a claim that
+et al. 2026). MELT reduces the memory cost of recurrent            FFNs are generally unhelpful under recurrence. A dense FFN
+decoding (Vendrell et al. 2026). These studies establish re-       is pointwise and has no direct cross-token path when repeated
+current depth as a useful scaling axis; we study the smaller       in isolation. In FullLoop it can still alter the input seen by a
+allocation decision inside that recurrent computation.             mixer on the next global pass, and sparse recurrent FFNs can
+Selective recurrence. SGT is the closest precedent for             activate different experts. GDN, by contrast, directly updates
+placing the recurrent boundary below the Transformer block.        and reads a sequence state on every application. MixerLoop
+It loops selected high-entropy attention heads and applies the     tests whether repeated stateful mixing alone provides a useful
+FFN once, substantially reducing additional training com-          recurrent trajectory.
+pute (Chen et al. 2026b). Sparse Layers and LoopMoE pro-              Let CA and CF denote the projection FLOPs of one mixer
+vide a complementary observation: repeated FFN compu-              and FFN. FullLoop costs T (CA + CF ) per physical layer,
+tation can remain useful when successive passes activate           while MixerLoop costs T CA +CF . The dense FFN accounts
+different experts (Lee et al. 2026; Chen et al. 2026a). The        for 61.2–61.3% of these projections in both model sizes. With
+shared lesson is not that one operator should always loop, but     T = 4,
+that useful recurrence must expose computation that changes                             T CA + CF
+                                                                                                      = 0.541,                  (6)
+across applications. Existing mechanistic work studies how                             T (CA + CF )
+looped models transform representations or implement iter-         so MixerLoop removes 45.9% of the recurrent-block pro-
+ative algorithms (Blayney et al. 2026). Our focus is narrower      jection compute.
+and causal: whether successive mixer applications make dis-
+tinct, finite changes to the final prediction.                     Finite Causal ITR
+Linear mixers as recurrent memory. Linear attention can            The quantity of interest is not whether hidden states change,
+be interpreted as a fast-weight memory that writes key–value       but whether a later mixer application causes a new contextual
+associations into a compact recurrent state (Schlag, Irie, and     effect that reaches the final prediction. We construct a finite
+Schmidhuber 2021). Delta-rule updates revise an existing           counterfactual for each physical layer ℓ. The native mixer pro-
+association before writing a new one, and GDN adds input-          cesses a sequence jointly and can use its causal convolution
+dependent forgetting to control memory over long sequences         and recurrent GDN state. Its context-off counterpart applies
+(Yang, Kautz, and Hatamizadeh 2025). A stateful mixer is           the same mixer independently to every token, resetting both
+therefore a natural test case for operator-selective recurrence:   forms of cross-token state between tokens. This preserves
+applying the same mixer again can change how information is        the mixer’s projections, gates, normalization, residual path,
+erased, written, and retrieved even though its parameters are      and token-local nonlinear computation; only cross-position
+shared. MixerLoop asks whether this refinement is sufficient       computation is removed.
+to preserve useful recurrent depth without repeating the dense        For a layer with T mixer occurrences, policy r ∈
+FFN.                                                               {0, . . . , T } keeps the first r occurrences native and re-
+                                                                   places the remaining T − r with the context-off mixer. Every
+                                                                   other layer, FFN, and downstream operation remains native.
+Figure 1: The recurrent boundary and the paper’s organizing principle. FullLoop repeats the complete GDN–FFN stack, whereas
+MixerLoop repeats the mixer within each physical layer and executes the dense FFN once. Useful recurrence must create a new
+contextual effect, preserve it to the prediction, and justify its marginal cost.
+
+
+In MixerLoop these occurrences are consecutive within a                  Direction alone is insufficient. We therefore report the
+layer; in FullLoop they occur across global stack passes. Let          squared Hellinger effect
+pℓ,r (· | x≤t ) be the final next-token distribution under this
+intervention. Policy 0 removes contextual mixing from that                               Hr2 = 12 ∥sℓ,r − sℓ,r−1 ∥2             (11)
+layer, whereas policy T is exactly the unmodified model.               and the signed ground-truth contribution
+   We work in the square-root probability representation
+                               √︂                                           gr = log pℓ,r (y | x≤t ) − log pℓ,r−1 (y | x≤t ).   (12)
+                  sℓ,r (x, t) = pℓ,r (· | x≤t ).            (7)
+                                                                       ITR and mITR ask whether the direction is new; Hr2 asks
+This choice places the trajectory in a fixed, task-level coordi-       whether it is large enough to alter the prediction; gr asks
+nate system and makes Euclidean distance equal to Hellinger            whether it helps the observed target. None of these quantities
+distance. Concatenating vocabulary coordinates over evalu-             substitutes for downstream evaluation.
+ated layers, windows, and prediction positions, define
+ ar = vecℓ,x,t [sℓ,r (x, t) − sℓ,0 (x, t)] ,     r = 1, . . . , T.
+                                                                                             Experiments
+                                                                 (8)   Setup
+Because the only altered computation is contextual mixing              We evaluate NoLoop, MixerLoop, and FullLoop at two
+in layer ℓ, ar is the finite cross-token effect observable at the      scales. The nominal 15M models contain 15.7M unique pa-
+language-model readout, rather than a hidden-state sensitiv-           rameters, six layers, width 288, four GDN heads, and FFN
+ity proxy.                                                             width 768. The nominal 110M models contain 116.9M pa-
+   Normalize each nonzero ar and form the Gram matrix                  rameters, twelve layers, width 768, twelve heads, and FFN
+Krs = ⟨ar /∥ar ∥, as /∥as ∥⟩. We define                                width 2,048. Recurrent models use T = 4. All models use a
+                                                                       32K SentencePiece tokenizer and context length 1,024. They
+                                  tr(K)2
+                       ITRT =              .                    (9)    are trained on the same 170-shard, 10.69B-token subset of
+                                  tr(K 2 )                             ClimbMix (Diao et al. 2025), streamed for 100,000 updates
+ITR is the participation-ratio rank of the cumulative readout          and 52.43B processed tokens. The global batch contains 512
+trajectory. It lies between one and T : one means successive           sequences. We use AdamW with (β1 , β2 ) = (0.9, 0.95),
+policies move the prediction in the same cumulative direc-             peak learning rate 5 × 10−4 , 1,000 warmup updates, cosine
+tion, while a larger value means recurrent depth exposes a             decay, weight decay 0.1, and gradient clipping at 1.0.
+more diverse set of observable contextual effects.                        Downstream quality is measured with the fixed 22-task
+   For the contribution of one additional pass, let dr =               CORE bundle. Each score is adjusted for its random baseline,
+ar − ar−1 with a0 = 0, and let Πr−1 project onto                       then multiplied by 100; CORE is the unweighted mean over
+span{d1 , . . . , dr−1 }. Marginal ITR is                              all tasks. Following the motivation from Ouro, we also show
+                                                                       the mean of the second, manipulation-heavy half of the suite
+                              ∥dr − Πr−1 dr ∥2                         rather than hiding task-level variation behind one aggregate.
+                 mITRr =                       ,               (10)
+                                   ∥dr ∥2                              These are single-checkpoint comparisons; we report all task
+                                                                       scores rather than treating examples as independent training
+with mITR1 = 1. It measures the fraction of the current
+                                                                       runs.
+finite readout update not represented by earlier updates.
+           Model        Hella-ZS Jeop. WikiQA ARC-E ARC-C COPA CSQA PIQA OBQA LAMB. BoolQ CORE
+           15M parameters / 52.4B training tokens
+           NoLoop            4.2 0.1          8.4      18.0     -3.1   -16.0      1.2   20.1    3.7    13.0   -26.4    5.0
+           MixerLoop         4.1 0.2          1.6      16.7     -4.0   -16.0      2.1   19.5    5.9    15.0    -6.9    6.5
+           FullLoop          4.6 0.0          6.4      19.1     -2.6    -8.0     -0.1   20.8    4.8    14.7   -24.0    5.5
+           110M parameters / 52.4B training tokens
+           NoLoop          19.6 1.3          31.5      39.1      3.4     2.0      0.7   37.6   10.7    30.6   -19.7   14.2
+           MixerLoop       21.1 2.4          35.3      41.9      6.9     8.0     10.4   37.8   11.7    30.7   -12.1   15.6
+           FullLoop        24.5 2.8          38.1      45.1      7.7    12.0     14.2   38.3   14.7    32.4   -21.6   17.5
+
+          Model        Hella. Wino. WinoG. Dyck LSAT-AR CS-Alg. Oper. Repeat SQuAD CoQA Lang-ID Manip.
+          15M parameters / 52.4B training tokens
+          NoLoop        3.4     0.4      -1.8    1.1          7.1      39.5    13.8     0.0    1.0     4.4     18.0     7.9
+          MixerLoop     3.8     9.9        4.8   8.9          5.4      37.0    11.0     0.0    1.3     5.5     17.6     9.6
+          FullLoop      4.2     7.0      -3.6    0.7          4.3      38.5     9.0     0.0    1.7     5.6     18.4     7.8
+          110M parameters / 52.4B training tokens
+          NoLoop       18.9 12.1          4.2 15.0            8.7      45.1    14.8     0.0    6.5    11.6     18.0    14.1
+          MixerLoop 20.6 16.5             2.8    9.8          3.8      43.0    12.4     0.0    8.0    12.6     18.6    13.5
+          FullLoop     24.3 18.7          4.5 19.9            7.1      43.2    15.2     3.1    9.8    14.2     17.4    16.1
+
+Table 1: CORE performance at matched parameter and training-token budgets. The upper and lower panels retain the fixed
+task split used in our evaluation report. Scores are chance-adjusted and multiplied by 100. CORE averages all 22 tasks; Manip.
+averages the 11 tasks in the lower panel. Best results within each scale are bold and second-best results are underlined.
+
+
+   For ITR, we sample held-out ClimbMix windows with a                  between the FLOP ratio and small-batch latency is expected
+fixed seed and evaluate positions in the second half of each            for several short, fused recurrent kernels; the saving becomes
+window. The 15M analysis uses 16 windows, 16 positions per              more visible as arithmetic utilization increases.
+window, and all six layers; the 110M analysis uses eight win-
+dows, eight positions, and all twelve layers. Gram matrices             Do Later Mixer Passes Reach the Prediction?
+concatenate all evaluated vocabulary directions with equal              Figure 2 separates novelty, magnitude, and task contribution.
+layer and window weighting. The native-prefix-T policy re-              At 15M, the cumulative ITR of MixerLoop grows from 1
+produces the unhooked model exactly (maximum absolute                   to 1.301 across four passes, nearly identical to FullLoop’s
+error 0 in all runs).                                                   1.305. Its marginal ITR for passes two through four is 0.988,
+                                                                        0.871, and 0.777. These passes are not small geometric arti-
+Capability per Recurrent Compute                                        facts: they account for 54.2% of the total squared Hellinger
+Table 1 gives the complete capability comparison. At 15M,               change, and every pass increases the observed next-token log
+MixerLoop reaches 6.52 CORE, compared with 5.01 for                     probability. The later three passes contribute +0.321 nats in
+NoLoop and 5.52 for FullLoop. It also obtains the highest               aggregate, compared with +0.210 for FullLoop.
+manipulation aggregate, 9.57. The full-stack model is there-               The same pattern survives scale. At 110M, MixerLoop
+fore dominated at this scale: it executes every FFN four times          reaches ITR 1.177, with marginal ITR 0.786, 0.688, and
+yet scores below MixerLoop. At 110M, MixerLoop im-                      0.672 after the first pass. Later passes account for 47.2%
+proves CORE from 14.16 to 15.56, while FullLoop reaches                 of its finite prediction change and add +0.070 nats to the
+17.52. Relative to NoLoop, MixerLoop retains 41.5% of                   true-token log probability. FullLoop follows a more diverse
+the full-loop improvement with the 54.1% recurrent-block                cumulative trajectory at this scale (ITR 1.293), but its later
+compute ratio in Equation 6. The held-out NLL follows the               signed gain is slightly smaller at +0.056 nats. Thus higher
+same ordering: NoLoop, MixerLoop, and FullLoop obtain                   trajectory rank is not itself a quality score: MixerLoop uses
+2.995, 2.946, and 2.936 at 15M, and 2.401, 2.377, and 2.342             fewer operator applications while retaining a sequence of
+at 110M.                                                                distinct, beneficial prediction corrections.
+   The theoretical saving also appears in wall-clock execu-             Controls and robustness. A randomly initialized 15M
+tion. We measure BF16 prefill at context 1,024 on one RTX               MixerLoop model provides the crucial dimensionality con-
+3090 Ti, returning only the final-token logits. At batch one,           trol. Its ITR is only 1.068 and marginal ITR falls from 0.440
+kernel-launch overhead limits the MixerLoop speedup over                to 0.283 and 0.241. More importantly, each pass changes
+FullLoop to 1.11× at both scales. At the largest measured               the output by only 6.4 × 10−6 squared Hellinger distance,
+batch (32 for 15M and 16 for 110M), median latency falls                and the later passes contribute −1.5 × 10−4 nats to the tar-
+from 61.5 to 45.7 ms and from 236.8 to 155.6 ms, respec-                get. Non-collinearity without magnitude or task alignment is
+tively: 1.35× and 1.52× higher throughput. These values                 therefore rejected by the monitor. On a second set of held-out
+use six warmup forwards and 20 timed forwards. The gap                  windows, the trained 15M ITR is 1.313 for MixerLoop and
+Figure 2: Finite causal readout trajectories at 15M (top) and 110M (bottom). For one layer at a time, contextual mixer passes are
+restored in execution order from the token-isolated policy. Left: cumulative readout ITR. Middle: squared Hellinger distance
+caused by each restored pass. Right: change in the ground-truth next-token log probability. Curves aggregate all evaluated layers,
+held-out windows, and prediction positions. NoLoop has only one mixer occurrence and therefore no later-pass trajectory.
+
+
+1.284 for FullLoop; increasing the context from 128 to 256          effects that survive the complete downstream network.
+tokens gives 1.327 and 1.311. The conclusion is stable to the          Two observations refine the interpretation of ITR. First, the
+sampled windows and context length.                                 cumulative ranks remain between 1.18 and 1.31 rather than
+                                                                    approaching four, even when individual marginal updates
+A layer-wise allocation signal. Figure 3 asks whether ag-           are substantially nonredundant. The recurrent mixer behaves
+gregate novelty is concentrated in a few physical layers.
+                                                                    like a sequence of distinct corrections that accumulate toward
+At 15M, 16 of 18 later MixerLoop layer–pass pairs have
+                                                                    a coherent predictive direction, not four independent algo-
+marginal ITR above 0.5, and all 18 have positive true-token
+                                                                    rithms. Second, rank must be read jointly with effect mag-
+contribution. At 110M, the corresponding counts are 19 of 36        nitude and sign. FullLoop has higher ITR at 110M, whereas
+for novelty and 30 of 36 for positive contribution. FullLoop        MixerLoop has the larger later true-token gain; a random
+maintains marginal ITR above 0.5 for every later layer–pass         network can assign a large fraction of tiny changes to later
+pair at both scales, but only 27 of 36 contributions are positive   passes while doing no useful work. This is why ITR is an
+at 110M. The monitor therefore distinguishes two decisions:         allocation diagnostic rather than a stand-alone benchmark.
+whether an operator family is worth recurring at all, and              Our claims are bounded in three ways. We study dense
+where its marginal readout effect has begun to saturate. The        GDN–FFN models with four recurrent passes at 15M and
+latter can guide layer- or head-selective recurrence without        110M parameters. SGT suggests that the same readout-level
+using hidden-state movement as the selection target.
+                                                                    test can guide recurrence in softmax attention, but we do
+                                                                    not claim architecture-independent rankings without that ex-
+                         Discussion                                 periment. The context-off policy is an ordered, prefix at-
+The intervention answers a more specific question than ordi-        tribution; interactions can make a different restoration or-
+nary loop truncation. It does not ask whether a model trained       der yield different marginal values. Finally, each architec-
+with four passes deteriorates when three are deleted. Instead,      ture is represented by one training run. The full task table
+all computation remains in place, token-local mixer behavior        and finite-intervention controls support the reported models,
+is preserved, and contextual passes are restored one at a time.     while training-seed uncertainty remains to be measured at
+The measured trajectory therefore identifies finite contextual      larger compute budgets.
+Figure 3: Layer-wise marginal ITR after the first contextual pass. Each cell shows the fraction of a pass’s finite readout update
+outside the span of earlier updates for the same physical layer. MixerLoop retains substantial novelty in most 15M layers and a
+more selective subset at 110M; FullLoop maintains high novelty across the stack. Layers are indexed from bottom to top.
+
+
+                       Conclusion                                  Deng, C.; Zhang, Y.; Zhu, R.-J.; Xu, Y.; Liu, J.; Ng,
+Looped language models need not repeat every expensive             T. S. E.; and Chen, H. 2026. LT2: Linear-Time Looped
+operator. MixerLoop applies recurrent depth to the stateful        Transformers. arXiv:2605.20670.
+token mixer and executes the dense FFN once, improving             Diao, S.; Yang, Y.; Fu, Y.; et al. 2025. CLIMB: Clustering-
+CORE over a non-recurrent GDN at both evaluated scales             Based Iterative Data Mixture Bootstrapping for Language
+while using 54% of FullLoop’s recurrent-block projection           Model Pre-Training. arXiv:2504.13161.
+compute. Finite causal ITR shows why this allocation is            Geiping, J.; McLeish, S.; Jain, N.; Kirchenbauer, J.; et al.
+viable: later mixer applications create new contextual di-         2025. Scaling up Test-Time Compute with Latent Reason-
+rections that change the final distribution and improve the        ing: A Recurrent Depth Approach. arXiv:2502.05171.
+observed next token. The broader design rule is simple. Al-        Lee, R.; Biloki, J.; Hu, E. J.; and May, J. 2026. Sparse
+locate recurrent compute where successive applications con-        Layers are Critical to Scaling Looped Language Models.
+tinue to produce nonredundant, task-observable effects; stop       arXiv:2605.09165.
+when either novelty or effect vanishes.
+                                                                   Saunshi, N.; Dikkala, N.; Li, Z.; Kumar, S.; and Reddi,
+                                                                   S. J. 2025. Reasoning with Latent Thoughts: On the Power
+                       References                                  of Looped Transformers. arXiv:2502.17416.
+Blayney, H.; Arroyo, Á.; Obando-Ceron, J.; Castro, P. S.;
+                                                                   Schlag, I.; Irie, K.; and Schmidhuber, J. 2021. Lin-
+et al. 2026. A Mechanistic Analysis of Looped Reasoning
+                                                                   ear Transformers Are Secretly Fast Weight Programmers.
+Language Models. arXiv:2604.11791.
+                                                                   arXiv:2102.11174.
+Chen, W.; Li, T.; Huang, W.; Yin, Y.; Shang, L.; and
+                                                                   Vendrell, V. C.; Masdemont, A. P.; Grillo, N.; Ros-Giralt,
+Qin, C. 2026a. LoopMoE: Unifying Iterative Compu-
+                                                                   J.; Behboodi, A.; and Massoli, F. V. 2026. Memory-
+tation with Mixture-of-Experts for Language Modeling.
+                                                                   Efficient Looped Transformer: Decoupling Compute from
+arXiv:2606.04438.
+                                                                   Memory in Looped Language Models. arXiv:2605.07721.
+Chen, Y.; Chen, Y.; Yang, Y.; et al. 2026b. Sparse Growing
+                                                                   Yang, L.; Lee, K.; Nowak, R.; and Papailiopoulos, D. 2024.
+Transformer: Training-Time Sparse Depth Allocation via
+                                                                   Looped Transformers are Better at Learning Learning
+Progressive Attention Looping. In Findings of the Associa-
+                                                                   Algorithms. arXiv:2311.12424.
+tion for Computational Linguistics: ACL 2026, 6168–6193.
+San Diego, California, United States: Association for Com-         Yang, S.; Kautz, J.; and Hatamizadeh, A. 2025. Gated
+putational Linguistics.                                            Delta Networks: Improving Mamba2 with Delta Rule.
+                                                                   arXiv:2412.06464.
+Dehghani, M.; Gouws, S.; Vinyals, O.; Uszkoreit,
+J.; and Kaiser, Ł. 2019.          Universal Transformers.          Zhu, R.-J.; Wang, Z.; Hua, K.; Zhang, T.; et al. 2026.
+arXiv:1807.03819.                                                  Scaling Latent Reasoning via Looped Language Models.
+                                                                   arXiv:2510.25741.
+
