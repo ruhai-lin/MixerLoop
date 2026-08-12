@@ -10,7 +10,6 @@ import torch
 import torch.nn as nn
 from fla.layers import GatedDeltaNet
 from fla.models.gated_deltanet.modeling_gated_deltanet import GatedDeltaNetPreTrainedModel
-from .layers import MixerLoopBlock
 from fla.modules import FusedCrossEntropyLoss, FusedLinearCrossEntropyLoss, RMSNorm
 from transformers.generation import GenerationMixin
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
@@ -18,6 +17,7 @@ from transformers.utils import logging
 from transformers.utils.deprecation import deprecate_kwarg
 
 from .configuration_mixerloop import MixerLoopConfig
+from .layers import MixerLoopBlock
 
 if TYPE_CHECKING:
     from transformers.processing_utils import Unpack
@@ -42,6 +42,7 @@ class MixerLoopPreTrainedModel(GatedDeltaNetPreTrainedModel):
                 mean=0.0,
                 std=self.config.initializer_range / scale,
             )
+
 
 class MixerLoopModel(MixerLoopPreTrainedModel):
 

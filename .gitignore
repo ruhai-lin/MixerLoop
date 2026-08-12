@@ -1,27 +1,30 @@
-.venv/
-.pytest_cache/
-__pycache__/
+/.venv/
+/references/
+/.pytest_cache/
+**/__pycache__/
 *.py[cod]
 *.egg-info/
-.coverage
-.mypy_cache/
-.ruff_cache/
+/.coverage
+/.mypy_cache/
+/.ruff_cache/
 
-data/
-outputs/
-core_bundle/
-wandb/
-runs/
+/data/
+/outputs/
+/core_bundle/
+/wandb/
+/runs/
+/build/
+/dist/
 
-build/
-dist/
+/hardware/outputs/
+/hardware/.Xil/
+/hardware/.ipcache/
+/hardware/analyzer_input/
+/hardware/tmp/
+/hardware/xcd.log
+/.Xil/
+/.ipcache/
+/analyzer_input/
 
-# log and config files
 *.log
 *.part
-log.*
-*.log
-*.cfg
-*.ini
-*.yml
-*.yaml

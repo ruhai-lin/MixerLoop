@@ -2,188 +2,216 @@
 
 # MixerLoop
 
-**Allocate recurrent compute to the token mixer, not automatically to the entire block.**
+**Recurrent compute allocation for Gated Delta Networks, from pretraining to FPGA build.**
 
 </div>
 
-MixerLoop is the reference implementation for studying where recurrent depth
-should be placed in Gated Delta Networks (GDNs). The repository exposes four
-matched architectures, a fixed ClimbMix training recipe, deterministic CORE
-evaluation, and Iterative Transport Rank (ITR) analysis.
+MixerLoop repeats each Gated DeltaNet token mixer while executing the FFN once.
+The repeated calls share the physical layer's mixer parameters, so increasing
+the loop count allocates more recurrent computation without adding mixer
+weights. This repository is the end-to-end implementation: FLAME pretraining,
+Hugging Face checkpoints, W8A8 deployment export, a C++ reference, Vitis HLS,
+and the KV260 Vivado/Vitis build.
 
-## Architectures
+The current release intentionally validates one deployment profile. Other model
+sizes remain configurable through Transformers JSON files, but are not shipped
+as tuned presets.
 
-Let each physical layer contain a GDN mixer $A_i$ and an FFN $F_i$, and let the
-loop count be $T=4$.
+## Architecture and deployment profile
 
-| Name | Recurrent computation | Role |
-|---|---|---|
-| `gdn` | $F_i \circ A_i$ | no-loop control |
-| `mixerloop` | $F_i \circ A_i^T$ | proposed architecture |
-| `ffnloop` | $F_i^T \circ A_i$ | allocation control |
-| `fullloop` | $(B_L \circ \cdots \circ B_1)^T$ | LT2-compatible full-stack loop |
+For physical layer `i`, MixerLoop computes
 
-`FullLoop` always means repetition of the complete physical layer stack. The
-repository intentionally contains no local interleaved-loop variant.
+```text
+for loop_slot in range(T):
+    h_input = h
+    h = h + GDN_i(RMSNorm_i(h))
+    h = h + residual_weight[loop_slot] * h_input
+h = h + FFN_i(FFNNorm_i(h))
+```
 
-## Installation
+The mixer and its norm are shared across loop calls. During autoregressive
+decode, each `(layer, loop_slot)` owns an independent recurrent state. T=1 and
+T=4 therefore use the same weight layout, accelerator datapath, and xclbin;
+only the runtime loop count and active state slots differ.
 
-Python 3.11 is recommended. Install a PyTorch build that matches the local CUDA
-driver before installing this package.
+The validated 15M-class profile is:
+
+| Field | Value |
+|---|---:|
+| hidden size | 256 |
+| physical layers | 8 |
+| heads / head dimension | 8 / 32 |
+| FFN intermediate size | 768 |
+| short convolution | 4 |
+| tokenizer / vocabulary | Llama 2 / 32,000 |
+| maximum hardware loop count | 4 |
+| deployment arithmetic | W8A8, group size 32 |
+
+## Environment
+
+Run the project inside the WSL Linux filesystem, such as
+`/home/<user>/Projects/MixerLoop`, rather than `/mnt/c`. Python uses one virtual
+environment at the repository root.
+
+The local validation environment is Ubuntu 22.04, Python 3.10.12, PyTorch
+2.13.0+cu130, an RTX 4060 Laptop GPU, and AMD Vitis/Vivado 2025.2. Install the
+PyTorch wheel that matches the target machine first; the remaining software
+versions are pinned by `pyproject.toml`.
 
 ```bash
 git clone https://github.com/ruhai-lin/MixerLoop.git
 cd MixerLoop
-python -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
-pip install -U pip setuptools wheel
-
-# Select the appropriate wheel index for your CUDA installation.
-pip install torch torchvision torchaudio
-pip install -e .
+python -m pip install -U pip setuptools wheel ninja packaging
+python -m pip install torch==2.13.0
+python -m pip install -e '.[dev]'
+python -m pip check
+python -m pytest -q
 ```
 
-CUDA/NCCL and extension-build details are documented in
-[`flame-installation.md`](flame-installation.md).
+Training machines only need the Python/CUDA stack. HLS and xclbin generation
+additionally require matching Vitis/Vivado and a KV260 platform; see
+[`hardware/README.md`](hardware/README.md).
 
-The software contract pins `transformers==4.57.3`, `datasets==4.5.0`,
-`flash-linear-attention==0.5.1`, `torchdata==0.11.0`, and TorchTitan commit
-`0b44d4c`. The release validation used PyTorch `2.13.0+cu130`; PyTorch itself
-is left as a lower-bounded dependency because its wheel must match the host CUDA
-installation.
+## TinyStories smoke training
 
-## Prepare ClimbMix-10B
+`train.sh` defaults to the pinned TinyStories revision and the included Llama 2
+tokenizer. The launcher saves the resolved model config before training and,
+after the final distributed checkpoint, automatically writes both software and
+hardware artifacts.
 
-The paper corpus is fixed to train shards `00000`–`00169` from
-`karpathy/climbmix-400b-shuffle`; shard `06542` is reserved for validation. The
-included tokenizer is the exact SentencePiece model used to create the released
-checkpoints.
+Run short T=1 and T=4 smoke jobs:
+
+```bash
+source .venv/bin/activate
+
+LOOP_COUNT=1 STEPS=1000 NGPU=1 MICRO_BATCH=1 GLOBAL_BATCH=8 \
+  OUTPUT=outputs/tinystories-15m-t1 bash train.sh
+
+LOOP_COUNT=4 STEPS=1000 NGPU=1 MICRO_BATCH=1 GLOBAL_BATCH=8 \
+  OUTPUT=outputs/tinystories-15m-t4 bash train.sh
+```
+
+For a very short pipeline check, set `STEPS=1 GLOBAL_BATCH=1 SEQ_LEN=64`.
+Common overrides include `DATASET`, `DATASET_REVISION`, `DATASET_SPLIT`,
+`TOKENIZER`, `SEQ_LEN`, `MICRO_BATCH`, `GLOBAL_BATCH`, `LEARNING_RATE`,
+`WARMUP_STEPS`, and `OUTPUT`. Set `WANDB=1` to enable Weights & Biases.
+
+Each output directory is self-contained:
+
+```text
+outputs/tinystories-15m-t4/
+├── checkpoint/step-1000/     # resumable Flame/TorchTitan DCP
+├── config.json               # resolved HF config (including T)
+├── model.safetensors         # full-precision HF checkpoint
+├── model.q8.bin              # version-3 hardware checkpoint
+├── tokenizer.model           # SentencePiece source
+├── tokenizer.bin             # hardware tokenizer table
+├── logs/
+└── source/                   # training source snapshot
+```
+
+Load a produced HF checkpoint after the package has registered MixerLoop:
+
+```python
+import custom_models  # registers the architecture with Transformers
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+model = AutoModelForCausalLM.from_pretrained("outputs/tinystories-15m-t4")
+tokenizer = AutoTokenizer.from_pretrained("outputs/tinystories-15m-t4")
+```
+
+## Hardware validation without a board
+
+The current completion boundary is an offline build; KV260 deployment is not
+required. After training, use either T checkpoint with the same hardware tree:
+
+```bash
+cmake -S hardware -B hardware/outputs/cpu
+cmake --build hardware/outputs/cpu -j
+
+bash hardware/scripts/build_sim.sh
+hardware/outputs/sim/kernel_sim outputs/tinystories-15m-t1/model.q8.bin 8
+hardware/outputs/sim/kernel_sim outputs/tinystories-15m-t4/model.q8.bin 8
+
+source /opt/xilinx/2025.2/Vitis/settings64.sh
+bash hardware/scripts/build_hls.sh
+bash hardware/scripts/build_link.sh
+```
+
+Successful HLS synthesis, Vivado implementation, and a non-empty xclbin close
+the offline flow. Detailed prerequisites, reports, cross-compiling the optional
+host, and packaging are documented in the hardware README.
+
+## Other datasets and evaluation
+
+The FLAME data path accepts ordinary Hugging Face datasets, streaming datasets,
+multiple datasets, and the deterministic pretokenized ClimbMix reader. Prepare
+the optional fixed ClimbMix corpus with:
 
 ```bash
 python -m flame.datasets.climbmix --data_dir data/climbmix-10b
 ```
 
-The resulting 170 training shards contain 10,690,433,521 tokens. The built-in
-backend writes `manifest.json` with per-shard SHA-256 hashes and token counts.
-Training reads the uint16 token files directly, so there is no
-online-tokenization drift.
-
-## Reproduce training
-
-The locked recipe uses sequence length 1024, a global batch of 512 sequences,
-AdamW with $(\beta_1,\beta_2)=(0.9,0.95)$, learning rate $5\times10^{-4}$,
-1,000 warmup updates, and cosine decay to zero. The released legacy models ran
-for 100,000 updates: 52,428,800,000 processed tokens over the fixed 10B-token
-corpus.
-
-The launcher derives gradient accumulation from GPU count and per-GPU
-micro-batch while holding the global batch fixed:
+CORE and lm-eval entry points remain available:
 
 ```bash
-# Primary missing comparison on two 24 GB GPUs
-NGPU=2 DATA_DIR=data/climbmix-10b \
-  bash train.sh ffnloop 15m
-
-NGPU=2 DATA_DIR=data/climbmix-10b MICRO_BATCH=1 \
-  bash train.sh ffnloop 110m
+python eval/core_eval.py --model_path outputs/tinystories-15m-t4
+python eval/harness_eval.py --model_path outputs/tinystories-15m-t4
 ```
 
-The same entry point reproduces every architecture:
+### AAAI paper milestone
 
-```bash
-NGPU=2 DATA_DIR=data/climbmix-10b \
-  bash train.sh mixerloop 15m
-```
+`references/main.tex` records the earlier AAAI submission milestone. Its model
+sizes were exploratory and are not the current hardware profile, but its finite
+readout ITR and synchronized BF16 throughput experiments remain important
+research evidence. The corresponding evaluators are retained so those claims
+can be reproduced from the submitted NoLoop, MixerLoop, and FullLoop HF
+checkpoints.
 
-Set `STEPS`, `SEED`, `OUTPUT`, or `MICRO_BATCH` through environment variables.
-Changing `STEPS` creates a shorter diagnostic run and is not the paper recipe.
-Set `WANDB=1` to enable Weights & Biases logging. Final DCP checkpoints are
-automatically exported to Transformers `model.safetensors` format.
-
-## Released checkpoints
-
-Released checkpoints are hosted at
-[`ruhai-lin/MixerLoop`](https://huggingface.co/ruhai-lin/MixerLoop) as
-Transformers folders `{gdn,mixerloop,fullloop}-{15m,42m,110m}`. Downloaded
-weights must use the same layout under local `outputs/` (for example
-`outputs/mixerloop-15m`), matching the paths expected by training and
-evaluation. New models trained by this repository are saved directly in
-Transformers format; the one-time legacy conversion utilities are intentionally
-not part of the release codebase.
-
-Clone the full release into `outputs/`:
-
-```bash
-hf download ruhai-lin/MixerLoop --local-dir outputs
-```
-
-Or pull a single checkpoint (same path convention):
-
-```bash
-hf download ruhai-lin/MixerLoop \
-  --include "mixerloop-15m/*" \
-  --local-dir outputs
-```
-
-## Evaluation
-
-CORE evaluation downloads Karpathy's fixed evaluation bundle on first use:
-
-```bash
-python eval/core_eval.py \
-  --model_path outputs/mixerloop-15m \
-  --out_dir outputs/mixerloop-15m/eval/core
-```
-
-Run the optional lm-eval suite after `pip install -e '.[eval]'`:
-
-```bash
-python eval/harness_eval.py \
-  --model_path outputs/mixerloop-15m \
-  --out_dir outputs/mixerloop-15m/eval/harness
-```
-
-ITR is defined for MixerLoop's repeated mixer trajectory:
+Finite ITR disables only cross-token computation in a selected mixer, restores
+contextual passes in execution order, and measures the final vocabulary
+distribution. It reports participation-ratio ITR, marginal ITR, squared
+Hellinger effect, and ground-truth next-token log-probability gain:
 
 ```bash
 python eval/itr_eval.py \
-  --model_path outputs/mixerloop-15m \
+  --model_paths outputs/gdn-15m outputs/mixerloop-15m outputs/fullloop-15m \
   --data_dir data/climbmix-10b \
-  --out_dir outputs/mixerloop-15m/eval/itr
+  --out_dir outputs/itr-readout-15m
 ```
 
-Published results are:
+The paper throughput protocol uses BF16 prefill at length 1,024, final-token
+logits, six warmup forwards, 20 synchronized timed forwards, and one GPU:
 
-| Architecture | 15M CORE | 42M CORE | 110M CORE |
-|---|---:|---:|---:|
-| GDN | 0.0501 | 0.0918 | 0.1416 |
-| MixerLoop | **0.0652** | **0.1122** | **0.1556** |
-| FFNLoop | -- | -- | -- |
-| FullLoop | 0.0552 | 0.1072 | **0.1752** |
+```bash
+python eval/throughput_eval.py \
+  --model_paths outputs/mixerloop-15m outputs/fullloop-15m \
+  --batch_size 32 \
+  --out_file outputs/throughput-15m-batch32.json
+```
+
+Install these optional dependencies with `python -m pip install -e '.[eval]'`.
+FullLoop is retained only to load and evaluate the paper checkpoint; it is not
+a shipped training preset or part of the current deployment path.
 
 ## Repository layout
 
 ```text
-configs/                 15M and 110M configs for four architectures
-custom_models/           MixerLoop, FFNLoop, and FullLoop implementations
-flame/                   compact Flame/TorchTitan training engine
-flame/datasets/          fixed ClimbMix download, tokenization, and reader
-eval/                    CORE, lm-eval, and ITR entry points
-tests/                   model, data-resume, and metric regression tests
+assets/tokenizer/        Llama 2 tokenizer source
+configs/                 shipped MixerLoop profile
+custom_models/mixerloop/ Transformers model implementation
+flame/                   FLAME/TorchTitan training and final export
+eval/                    CORE and lm-eval entry points
+hardware/                C++ reference, HLS kernel, build and simulation tools
+tests/                   architecture, data-resume and export contracts
 ```
 
-## Reproducibility notes
-
-- `ClimbMix-10B` names the unique corpus; the released models processed 52.43B
-  training tokens over that corpus.
-- Training examples include an explicit next-token label, matching the original
-  LT2.c/LT3.c objective at all 1,024 positions.
-- Checkpoint/resume includes the exact shuffled shard and window cursor.
-- Weight decay is applied to matrix parameters but not norms, biases, `A_log`,
-  or `dt_bias`, matching the original optimizer grouping.
+The local `references/` directory contains development history and is ignored by
+Git. Release behavior is defined only by files in the main repository.
 
 ## Acknowledgments
 
-The training runtime builds on [Flame](https://github.com/fla-org/flame),
-[TorchTitan](https://github.com/pytorch/torchtitan), and
-[Flash Linear Attention](https://github.com/fla-org/flash-linear-attention).
+The training runtime builds on FLAME, TorchTitan, Flash Linear Attention, and
+Transformers. The hardware flow targets AMD Vitis/Vivado and the KV260 platform.

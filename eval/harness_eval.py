@@ -22,10 +22,10 @@ RUN_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
 if RUN_ROOT not in sys.path:
     sys.path.insert(0, RUN_ROOT)
 
-import custom_models  # noqa: F401
 from lm_eval import simple_evaluate
 from lm_eval.api.registry import get_model
 
+import custom_models  # noqa: F401
 
 DEFAULT_TASKS = [
     "hellaswag",

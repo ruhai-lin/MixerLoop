@@ -4,13 +4,12 @@ from __future__ import annotations
 
 import math
 import warnings
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 from fla.layers import GatedDeltaNet
 from fla.models.gated_deltanet.modeling_gated_deltanet import GatedDeltaNetPreTrainedModel
-from .layers import FullLoopBlock
 from fla.modules import FusedCrossEntropyLoss, FusedLinearCrossEntropyLoss, RMSNorm
 from transformers.generation import GenerationMixin
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
@@ -18,6 +17,7 @@ from transformers.utils import logging
 from transformers.utils.deprecation import deprecate_kwarg
 
 from .configuration_fullloop import FullLoopConfig
+from .layers import FullLoopBlock
 
 if TYPE_CHECKING:
     from transformers.processing_utils import Unpack
@@ -42,6 +42,7 @@ class FullLoopPreTrainedModel(GatedDeltaNetPreTrainedModel):
                 mean=0.0,
                 std=self.config.initializer_range / scale,
             )
+
 
 class FullLoopModel(FullLoopPreTrainedModel):
 

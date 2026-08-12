@@ -315,11 +315,14 @@ def evaluate_task_batched(model, tokenizer, data, device, task_meta, eval_batch_
             fewshot_examples = [data[i] for i in fewshot_indices]
 
         if task_type == "multiple_choice":
-            toks, starts, ends = batch_sequences_mc(tokenizer, render_prompts_mc(item, continuation_delimiter, fewshot_examples))
+            prompts = render_prompts_mc(item, continuation_delimiter, fewshot_examples)
+            toks, starts, ends = batch_sequences_mc(tokenizer, prompts)
         elif task_type == "schema":
-            toks, starts, ends = batch_sequences_schema(tokenizer, render_prompts_schema(item, continuation_delimiter, fewshot_examples))
+            prompts = render_prompts_schema(item, continuation_delimiter, fewshot_examples)
+            toks, starts, ends = batch_sequences_schema(tokenizer, prompts)
         elif task_type == "language_modeling":
-            toks, starts, ends = batch_sequences_lm(tokenizer, render_prompts_lm(item, continuation_delimiter, fewshot_examples))
+            prompts = render_prompts_lm(item, continuation_delimiter, fewshot_examples)
+            toks, starts, ends = batch_sequences_lm(tokenizer, prompts)
         else:
             raise ValueError(f"Unsupported task type: {task_type}")
 

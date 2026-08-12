@@ -2,148 +2,123 @@
 
 set -euo pipefail
 
-argument_value() {
-  local wanted="$1"
-  shift
-  while (($#)); do
-    if [[ "$1" == "$wanted" && $# -ge 2 ]]; then
-      printf '%s' "$2"
-      return 0
-    fi
-    shift
-  done
-  return 1
-}
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+cd "$ROOT"
 
-# `train.sh ARCH SIZE` is the locked ClimbMix paper recipe. Any other argument
-# list is forwarded as ordinary Flame CLI overrides.
-if [[ $# -eq 2 && "$1" =~ ^(gdn|mixerloop|ffnloop|fullloop)$ && "$2" =~ ^(15m|110m)$ ]]; then
-  arch="$1"
-  size="$2"
-  NNODE=${NNODE:-1}
-  NGPU=${NGPU:-2}
-  SEED=${SEED:-1337}
-  STEPS=${STEPS:-100000}
-  DATA_DIR=${DATA_DIR:-data/climbmix-10b}
-  TOKENIZER=${TOKENIZER:-assets/tokenizer}
-  OUTPUT=${OUTPUT:-outputs/${arch}-${size}}
-
-  if [[ "$size" == "15m" ]]; then
-    MICRO_BATCH=${MICRO_BATCH:-8}
-  else
-    MICRO_BATCH=${MICRO_BATCH:-1}
-  fi
-
-  denominator=$((NGPU * MICRO_BATCH))
-  if ((512 % denominator != 0)); then
-    echo "NGPU * MICRO_BATCH must divide the global batch of 512 sequences" >&2
-    exit 2
-  fi
-  GRAD_ACCUM=${GRAD_ACCUM:-$((512 / denominator))}
-  if ((NGPU * MICRO_BATCH * GRAD_ACCUM != 512)); then
-    echo "The paper recipe requires NGPU * MICRO_BATCH * GRAD_ACCUM = 512" >&2
-    exit 2
-  fi
-
-  train_args=(
-    --job.config_file flame/models/fla.toml
-    --job.dump_folder "$OUTPUT"
-    --model.config "configs/${arch}_${size}.json"
-    --model.tokenizer_path "$TOKENIZER"
-    --optimizer.name AdamW
-    --optimizer.implementation fused
-    --optimizer.eps 1e-8
-    --optimizer.beta1 0.9
-    --optimizer.beta2 0.95
-    --optimizer.weight_decay 0.1
-    --optimizer.lr 5e-4
-    --lr_scheduler.warmup_steps 1000
-    --lr_scheduler.decay_type cosine
-    --lr_scheduler.lr_min 0.0
-    --training.batch_size "$MICRO_BATCH"
-    --training.seq_len 1024
-    --training.context_len 1024
-    --training.gradient_accumulation_steps "$GRAD_ACCUM"
-    --training.steps "$STEPS"
-    --training.max_norm 1.0
-    --training.dataset karpathy/climbmix-400b-shuffle
-    --training.dataset_split train
-    --training.data_dir "$DATA_DIR"
-    --training.num_workers 0
-    --training.seed "$SEED"
-    --training.data_parallel_replicate_degree "$NGPU"
-    --training.data_parallel_shard_degree 1
-    --training.tensor_parallel_degree 1
-    --training.disable_loss_parallel
-    --checkpoint.interval 2000
-    --checkpoint.keep_latest_k 2
-    --checkpoint.load_step -1
-    --metrics.log_freq 20
-  )
-  if [[ "${WANDB:-0}" == "1" ]]; then
-    train_args+=(--metrics.enable_wandb)
-  fi
-else
-  NNODE=${NNODE:-1}
-  NGPU=${NGPU:-8}
-  train_args=("$@")
+if [[ ! -x .venv/bin/python ]]; then
+  echo "Missing .venv. Follow the installation steps in README.md first." >&2
+  exit 2
 fi
 
-LOG_RANK=${LOG_RANK:-0}
-MASTER_ADDR=${MASTER_ADDR:-localhost}
-MASTER_PORT=${MASTER_PORT:-0}
+export PATH="$ROOT/.venv/bin:$PATH"
 
-path=$(argument_value --job.dump_folder "${train_args[@]}") || {
-  echo "Missing --job.dump_folder" >&2
-  exit 2
-}
-steps=$(argument_value --training.steps "${train_args[@]}") || {
-  echo "Missing --training.steps" >&2
-  exit 2
-}
-config=$(argument_value --model.config "${train_args[@]}") || {
-  echo "Missing --model.config" >&2
-  exit 2
-}
-tokenizer=$(argument_value --model.tokenizer_path "${train_args[@]}") || {
-  echo "Missing --model.tokenizer_path" >&2
-  exit 2
-}
+LOOP_COUNT=${LOOP_COUNT:-4}
+NGPU=${NGPU:-1}
+NNODE=${NNODE:-1}
+STEPS=${STEPS:-1000}
+SEQ_LEN=${SEQ_LEN:-256}
+MICRO_BATCH=${MICRO_BATCH:-1}
+GLOBAL_BATCH=${GLOBAL_BATCH:-8}
+SEED=${SEED:-1337}
+DATASET=${DATASET:-roneneldan/TinyStories}
+DATASET_SPLIT=${DATASET_SPLIT:-train}
+DATASET_REVISION=${DATASET_REVISION:-f54c09fd23315a6f9c86f9dc80f725de7d8f9c64}
+TOKENIZER=${TOKENIZER:-assets/tokenizer}
+OUTPUT=${OUTPUT:-outputs/tinystories-15m-t${LOOP_COUNT}}
+NUM_WORKERS=${NUM_WORKERS:-0}
+CHECKPOINT_INTERVAL=${CHECKPOINT_INTERVAL:-2000}
 
-model_type=$(
-  python -c \
-    "import fla.models, custom_models, sys; from transformers import AutoConfig; print(AutoConfig.from_pretrained(sys.argv[1]).model_type)" \
-    "$config"
+if ((LOOP_COUNT < 1 || LOOP_COUNT > 4)); then
+  echo "LOOP_COUNT must be between 1 and 4" >&2
+  exit 2
+fi
+denominator=$((NGPU * MICRO_BATCH))
+if ((GLOBAL_BATCH % denominator != 0)); then
+  echo "NGPU * MICRO_BATCH must divide GLOBAL_BATCH" >&2
+  exit 2
+fi
+GRAD_ACCUM=${GRAD_ACCUM:-$((GLOBAL_BATCH / denominator))}
+if ((NGPU * MICRO_BATCH * GRAD_ACCUM != GLOBAL_BATCH)); then
+  echo "NGPU * MICRO_BATCH * GRAD_ACCUM must equal GLOBAL_BATCH" >&2
+  exit 2
+fi
+
+train_args=(
+  --job.config_file flame/models/fla.toml
+  --job.dump_folder "$OUTPUT"
+  --model.config configs/mixerloop_15m.json
+  --model.tokenizer_path "$TOKENIZER"
+  --model.loop_count "$LOOP_COUNT"
+  --optimizer.name AdamW
+  --optimizer.implementation fused
+  --optimizer.eps 1e-8
+  --optimizer.beta1 0.9
+  --optimizer.beta2 0.95
+  --optimizer.weight_decay 0.1
+  --optimizer.lr "${LEARNING_RATE:-5e-4}"
+  --lr_scheduler.warmup_steps "${WARMUP_STEPS:-100}"
+  --lr_scheduler.decay_type cosine
+  --lr_scheduler.lr_min 0.0
+  --training.batch_size "$MICRO_BATCH"
+  --training.seq_len "$SEQ_LEN"
+  --training.context_len "$SEQ_LEN"
+  --training.gradient_accumulation_steps "$GRAD_ACCUM"
+  --training.steps "$STEPS"
+  --training.max_norm 1.0
+  --training.dataset "$DATASET"
+  --training.dataset_split "$DATASET_SPLIT"
+  --training.dataset_revision "$DATASET_REVISION"
+  --training.data_dir ""
+  --training.streaming
+  --training.num_workers "$NUM_WORKERS"
+  --training.seed "$SEED"
+  --training.data_parallel_replicate_degree "$NGPU"
+  --training.data_parallel_shard_degree 1
+  --training.tensor_parallel_degree 1
+  --training.disable_loss_parallel
+  --checkpoint.enable_checkpoint
+  --checkpoint.interval "$CHECKPOINT_INTERVAL"
+  --checkpoint.keep_latest_k 2
+  --checkpoint.load_step -1
+  --metrics.log_freq "${LOG_FREQ:-20}"
 )
+if [[ "${WANDB:-0}" == "1" ]]; then
+  train_args+=(--metrics.enable_wandb)
+fi
 
-mkdir -p "$path/source"
-cp -a assets configs custom_models eval flame pyproject.toml train.sh "$path/source/"
+mkdir -p "$OUTPUT/source"
+cp -a assets configs custom_models flame pyproject.toml train.sh "$OUTPUT/source/"
 
-run_name="${model_type}-$(basename "$path")"
-run_id="${WANDB_RUN_ID:-${run_name}-$(date +%Y%m%d%H%M)}"
+run_name="mixerloop-$(basename "$OUTPUT")"
 export WANDB_PROJECT=${WANDB_PROJECT:-mixerloop}
 export WANDB_NAME=${WANDB_NAME:-$run_name}
-export WANDB_RUN_ID=$run_id
+export WANDB_RUN_ID=${WANDB_RUN_ID:-${run_name}-$(date +%Y%m%d%H%M)}
 export WANDB_RESUME=allow
 
-echo "Launching ${model_type} training in ${path}"
+echo "Training MixerLoop T=$LOOP_COUNT for $STEPS steps in $OUTPUT"
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 torchrun \
   --nnodes="$NNODE" \
   --nproc_per_node="$NGPU" \
   --rdzv_backend=c10d \
-  --rdzv_endpoint="${MASTER_ADDR}:${MASTER_PORT}" \
-  --local-ranks-filter="$LOG_RANK" \
+  --rdzv_endpoint="${MASTER_ADDR:-localhost}:${MASTER_PORT:-0}" \
+  --local-ranks-filter="${LOG_RANK:-0}" \
   --role=rank \
   --tee=3 \
-  --log-dir="$path/logs" \
+  --log-dir="$OUTPUT/logs" \
   -m flame.train "${train_args[@]}"
 
-echo "Converting final DCP checkpoint to Hugging Face format"
-python -m flame.utils.convert_dcp_to_hf \
-  --path "$path" \
-  --step "$steps" \
-  --config "$config" \
-  --tokenizer "$tokenizer"
+resolved_config="$OUTPUT/config.json"
+if [[ ! -f "$resolved_config" ]]; then
+  echo "Training did not write resolved config: $resolved_config" >&2
+  exit 1
+fi
 
-echo "Training and export complete: $path"
+echo "Exporting HF and hardware artifacts"
+python -m flame.utils.convert_dcp_to_hf \
+  --path "$OUTPUT" \
+  --step "$STEPS" \
+  --config "$resolved_config" \
+  --tokenizer "$TOKENIZER"
+
+echo "Complete: $OUTPUT"

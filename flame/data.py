@@ -15,11 +15,12 @@ from datasets import Dataset, IterableDataset, interleave_datasets, load_dataset
 from datasets.iterable_dataset import ShufflingConfig
 from torch.distributed.checkpoint.stateful import Stateful
 from torchdata.stateful_dataloader import StatefulDataLoader
-from transformers import PreTrainedTokenizer
-
-from flame.datasets.climbmix import ClimbMixDataset, REPOSITORY_ID as CLIMBMIX_REPOSITORY_ID
 from torchtitan.tools import utils
 from torchtitan.tools.logging import logger
+from transformers import PreTrainedTokenizer
+
+from flame.datasets.climbmix import REPOSITORY_ID as CLIMBMIX_REPOSITORY_ID
+from flame.datasets.climbmix import ClimbMixDataset
 
 
 class BufferShuffledIterableDataset(IterableDataset):
@@ -559,6 +560,7 @@ def build_dataset(
     dataset: str,
     dataset_name: str = None,
     dataset_split: str = 'train',
+    dataset_revision: str = None,
     data_dir: str = None,
     data_files: str = None,
     data_probs: List[float] = None,
@@ -575,15 +577,17 @@ def build_dataset(
         )
 
     color = utils.Color
-    min_num_shards = dp_degree * num_workers if dp_degree else None
+    dataset_name = dataset_name or None
+    data_dir = data_dir or None
+    min_num_shards = dp_degree * max(1, num_workers) if dp_degree else None
     if len(dataset.split(',')) == 1:
         dataset = load_dataset(
             path=dataset,
             name=dataset_name,
             split=dataset_split,
+            revision=dataset_revision,
             data_dir=data_dir,
             data_files=data_files,
-            trust_remote_code=True,
             streaming=streaming,
             num_proc=num_workers if not streaming else None,
         )
@@ -608,9 +612,9 @@ def build_dataset(
                     path=dataset,
                     name=dataset_name,
                     split=dataset_split,
+                    revision=dataset_revision,
                     data_dir=data_dir,
                     data_files=data_files,
-                    trust_remote_code=True,
                     streaming=False,
                     num_proc=num_workers,
                 )
@@ -670,9 +674,9 @@ def build_dataset(
                 path=datasets[i],
                 name=dataset_names[i],
                 split=dataset_splits[i],
+                revision=dataset_revision,
                 data_dir=data_dirs[i],
                 data_files=data_files[i],
-                trust_remote_code=True,
                 streaming=streaming,
                 num_proc=(
                     num_workers
@@ -710,9 +714,9 @@ def build_dataset(
                         path=datasets[i],
                         name=dataset_names[i],
                         split=dataset_splits[i],
+                        revision=dataset_revision,
                         data_dir=data_dirs[i],
                         data_files=data_files[i],
-                        trust_remote_code=True,
                         streaming=False,
                         num_proc=num_workers,
                     )

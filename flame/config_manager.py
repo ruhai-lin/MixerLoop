@@ -120,6 +120,12 @@ class JobConfig:
             help="Tokenizer path",
         )
         self.parser.add_argument(
+            "--model.loop_count",
+            type=int,
+            default=None,
+            help="Override the loop count stored in the model config",
+        )
+        self.parser.add_argument(
             "--model.converters",
             type=string_list,
             nargs="+",
@@ -317,6 +323,11 @@ class JobConfig:
             "--training.dataset_split",
             default=None,
             help="Dataset split to use, with comma separated values if provided",
+        )
+        self.parser.add_argument(
+            "--training.dataset_revision",
+            default=None,
+            help="Pinned Hugging Face dataset revision",
         )
         self.parser.add_argument(
             "--training.data_dir",

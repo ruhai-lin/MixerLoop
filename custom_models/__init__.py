@@ -1,21 +1,16 @@
-"""Register the three recurrent GDN architectures with Transformers."""
+"""Register current MixerLoop and the historical FullLoop paper baseline."""
 
-from . import ffnloop, fullloop, mixerloop
-from .ffnloop import FFNLoopConfig, FFNLoopForCausalLM, FFNLoopModel
+from . import fullloop, mixerloop
 from .fullloop import FullLoopConfig, FullLoopForCausalLM, FullLoopModel
 from .mixerloop import MixerLoopConfig, MixerLoopForCausalLM, MixerLoopModel
 
 __all__ = [
-    "FFNLoopConfig",
-    "FFNLoopForCausalLM",
-    "FFNLoopModel",
     "FullLoopConfig",
     "FullLoopForCausalLM",
     "FullLoopModel",
     "MixerLoopConfig",
     "MixerLoopForCausalLM",
     "MixerLoopModel",
-    "ffnloop",
     "fullloop",
     "mixerloop",
 ]

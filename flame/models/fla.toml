@@ -19,9 +19,7 @@ data_parallel_shard_degree = -1
 tensor_parallel_degree = 1
 compile = false
 dataset = "karpathy/climbmix-400b-shuffle"
-dataset_name = ""
 dataset_split = "train"
-data_dir = "data/climbmix-10b"
 num_workers = 0
 pin_memory = false
 persistent_workers = false
@@ -45,7 +43,6 @@ folder = "checkpoint"
 interval_type = "steps"
 interval = 2000
 keep_latest_k = 2
-model_weights_only = false
 export_dtype = "float32"
 async_mode = "disabled"    # ["disabled", "async", "async_with_pinned_mem"]
 

@@ -8,6 +8,7 @@ import json
 import os
 import time
 from datetime import timedelta
+from pathlib import Path
 
 import fla.models  # noqa: registers fla model types (e.g. `transformer`) with AutoConfig/AutoModel
 import torch
@@ -157,6 +158,7 @@ def main(job_config: JobConfig):
         dataset=job_config.training.dataset,
         dataset_name=job_config.training.dataset_name,
         dataset_split=job_config.training.dataset_split,
+        dataset_revision=job_config.training.dataset_revision,
         data_dir=job_config.training.data_dir,
         data_files=job_config.training.data_files,
         data_probs=job_config.training.data_probs,
@@ -184,6 +186,10 @@ def main(job_config: JobConfig):
 
     logger.info(f"Loading model config from {job_config.model.config}")
     model_config = AutoConfig.from_pretrained(job_config.model.config)
+    if job_config.model.loop_count is not None:
+        if job_config.model.loop_count < 1:
+            raise ValueError("--model.loop_count must be at least 1")
+        model_config.loop_count = job_config.model.loop_count
     # set the model configs from training inputs:
     # 1. norm type to decide which norm layer to use
     # 2. disable fused norm if TP is enabled
@@ -207,6 +213,10 @@ def main(job_config: JobConfig):
             )
             model_config.fuse_linear_cross_entropy = False
     model_config.vocab_size = max(tokenizer.vocab_size, model_config.vocab_size)
+    if torch.distributed.get_rank() == 0:
+        output_path = Path(job_config.job.dump_folder)
+        output_path.mkdir(parents=True, exist_ok=True)
+        model_config.save_pretrained(output_path)
 
     logger.info(
         f"Building model from the config\n{color.green}{model_config}{color.reset}"

@@ -21,17 +21,13 @@ import torch
 from datasets import Dataset
 from torchdata.stateful_dataloader import StatefulDataLoader
 
-from flame.data import (
-    DataCollatorForLanguageModeling,
-    OnlineTokenizedIterableDataset,
-    ParallelAwareDataLoader,
-)
+from flame.data import DataCollatorForLanguageModeling, OnlineTokenizedIterableDataset, ParallelAwareDataLoader
 from flame.datasets.climbmix import ClimbMixDataset
-
 
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
+
 
 class DummyTokenizer:
     """Deterministic stand-in for a HF tokenizer.
@@ -159,6 +155,19 @@ def test_missing_text_and_content_raises():
     dl = _build_dl(ds, rank=0, world_size=1, num_workers=0)
     with pytest.raises(ValueError, match="No 'text' or 'content' field"):
         next(iter(dl))
+
+
+def test_zero_workers_still_builds_one_iterable_shard(monkeypatch):
+    source = Dataset.from_dict({"text": ["story"] * 8})
+
+    def fake_load_dataset(**kwargs):
+        return source
+
+    monkeypatch.setattr("flame.data.load_dataset", fake_load_dataset)
+    from flame.data import build_dataset
+
+    dataset = build_dataset("tiny", dp_degree=1, num_workers=0, seed=7)
+    assert dataset.num_shards == 1
 
 
 # --------------------------------------------------------------------------- #

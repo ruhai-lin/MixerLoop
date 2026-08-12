@@ -11,10 +11,10 @@ class MixerLoopConfig(PretrainedConfig):
 
     def __init__(
         self,
-        hidden_size: int = 288,
-        num_hidden_layers: int = 6,
-        num_heads: int = 4,
-        head_dim: int = 72,
+        hidden_size: int = 256,
+        num_hidden_layers: int = 8,
+        num_heads: int = 8,
+        head_dim: int = 32,
         expand_v: float = 1.0,
         intermediate_size: Optional[int] = 768,
         hidden_ratio: int = 4,
@@ -48,6 +48,8 @@ class MixerLoopConfig(PretrainedConfig):
         self.conv_size = conv_size
         self.attn_mode = attn_mode
         self.loop_count = loop_count
+        if self.loop_count < 1:
+            raise ValueError(f'loop_count must be at least 1, got {self.loop_count}')
         self.use_residual = use_residual
         self.max_position_embeddings = max_position_embeddings
         self.hidden_act = hidden_act
