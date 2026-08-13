@@ -29,7 +29,7 @@ dependencies = [
   "sentencepiece>=0.2,<0.3",
   "tensorboard",
   "tiktoken",
-  "torch>=2.9",
+  "torch>=2.7",
   "torchdata==0.11.0",
   "torchtitan @ git+https://github.com/pytorch/torchtitan.git@0b44d4c",
   "transformers==4.57.3",
