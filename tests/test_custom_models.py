@@ -41,12 +41,11 @@ def initialize_like_flame(config):
 
 
 @pytest.mark.parametrize("loop_count", [1, 4])
-def test_meta_materialization_initializes_gdn_and_loop_weights(loop_count):
+def test_meta_materialization_initializes_gdn(loop_count):
     model = initialize_like_flame(tiny_config(loop_count))
     base = model.model
 
-    assert base.residual_weight.shape == (loop_count, 32)
-    assert torch.count_nonzero(base.residual_weight) == 0
+    assert not hasattr(base, "residual_weight")
     assert all(torch.isfinite(parameter).all() for parameter in model.parameters())
     for layer in base.layers:
         mixer = layer.mixer
@@ -96,8 +95,7 @@ def test_mixerloop_repeats_only_the_mixer(loop_count):
     block.mixer = CountingMixer()
     block.ffn = CountingFFN()
 
-    residual_weight = torch.zeros(loop_count, config.hidden_size)
-    output = block(torch.zeros(1, 3, config.hidden_size), residual_weight)
+    output = block(torch.zeros(1, 3, config.hidden_size))
 
     assert block.mixer.calls == loop_count
     assert block.ffn.calls == 1

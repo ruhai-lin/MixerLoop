@@ -15,16 +15,16 @@ export PATH="$ROOT/.venv/bin:$PATH"
 LOOP_COUNT=${LOOP_COUNT:-4}
 NGPU=${NGPU:-1}
 NNODE=${NNODE:-1}
-STEPS=${STEPS:-1000}
+STEPS=${STEPS:-100000}
 SEQ_LEN=${SEQ_LEN:-256}
 MICRO_BATCH=${MICRO_BATCH:-1}
-GLOBAL_BATCH=${GLOBAL_BATCH:-8}
+GLOBAL_BATCH=${GLOBAL_BATCH:-512}
 SEED=${SEED:-1337}
 DATASET=${DATASET:-roneneldan/TinyStories}
 DATASET_SPLIT=${DATASET_SPLIT:-train}
 DATASET_REVISION=${DATASET_REVISION:-f54c09fd23315a6f9c86f9dc80f725de7d8f9c64}
 TOKENIZER=${TOKENIZER:-assets/tokenizer}
-OUTPUT=${OUTPUT:-outputs/tinystories15M_t${LOOP_COUNT}}
+OUTPUT=${OUTPUT:-outputs/tinystories15m_t${LOOP_COUNT}}
 NUM_WORKERS=${NUM_WORKERS:-0}
 CHECKPOINT_INTERVAL=${CHECKPOINT_INTERVAL:-2000}
 
@@ -56,7 +56,7 @@ train_args=(
   --optimizer.beta2 0.95
   --optimizer.weight_decay 0.1
   --optimizer.lr "${LEARNING_RATE:-5e-4}"
-  --lr_scheduler.warmup_steps "${WARMUP_STEPS:-100}"
+  --lr_scheduler.warmup_steps "${WARMUP_STEPS:-1000}"
   --lr_scheduler.decay_type cosine
   --lr_scheduler.lr_min 0.0
   --training.batch_size "$MICRO_BATCH"

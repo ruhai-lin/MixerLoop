@@ -59,19 +59,8 @@ class MixerLoopModel(MixerLoopPreTrainedModel):
         )
         self.norm = norm_cls(config.hidden_size, eps=config.norm_eps)
 
-        if config.use_residual:
-            self.residual_weight = nn.Parameter(
-                torch.zeros(config.loop_count, config.hidden_size)
-            )
-        else:
-            self.residual_weight = None
-
         self.gradient_checkpointing = False
         self.post_init()
-
-    def reset_parameters(self):
-        if self.residual_weight is not None:
-            nn.init.zeros_(self.residual_weight)
 
     def get_input_embeddings(self):
         return self.embeddings
@@ -113,13 +102,11 @@ class MixerLoopModel(MixerLoopPreTrainedModel):
                 hidden_states = self._gradient_checkpointing_func(
                     layer.__call__,
                     hidden_states,
-                    self.residual_weight,
                     attention_mask,
                 )
             else:
                 hidden_states = layer(
                     hidden_states,
-                    residual_weight=self.residual_weight,
                     attention_mask=attention_mask,
                     **kwargs,
                 )

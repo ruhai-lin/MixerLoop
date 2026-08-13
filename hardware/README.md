@@ -16,7 +16,7 @@ timing, and throughput comparisons meaningful.
 part=xck26-sfvc784-2LV-c  clock=150 MHz
 dim=256  hidden_dim=768  layers=8  heads=8
 head_k_dim=32  head_v_dim=32  conv_size=4
-vocab_size=32000  seq_len=1024
+vocab_size=32000  maximum_seq_len=1024
 W8A8 symmetric int8  group_size=32  checkpoint_version=2
 ```
 
@@ -103,8 +103,8 @@ passwordless `sudo`; no board password or private artifact is stored here.
 
 ## Checkpoint boundary
 
-The T=1 hardware loader consumes the established version-2 `GDNe` checkpoint.
-MixerLoop training now exports a version-3 loop-aware checkpoint, so those two
-formats are deliberately not presented as compatible. The next hardware phase
-will design the T=4 scheduler and update the deployment contract from this
-known-good T=1 checkpoint.
+The T=1 hardware loader and MixerLoop training use the same established
+version-2 `GDNe` checkpoint. The header records the training context length;
+the loader accepts values up to the hardware maximum of 1,024. Loop count is
+not encoded in the weight file. The next hardware phase will add T=4 scheduling
+from this known-good T=1 checkpoint.

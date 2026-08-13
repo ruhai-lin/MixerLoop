@@ -135,8 +135,8 @@ void LoadWeights(Weights& w, const std::string& path) {
       group_size != kQuantGroupSize) {
     throw std::runtime_error("checkpoint config does not match gdn.hls constants");
   }
-  if (h.seq_len != kSeqLen) {
-    throw std::runtime_error("checkpoint seq_len does not match M0 contract");
+  if (h.seq_len < 1 || h.seq_len > kSeqLen) {
+    throw std::runtime_error("checkpoint seq_len exceeds the hardware profile");
   }
 
   fs.seekg(kCheckpointHeaderBytes, std::ios::beg);

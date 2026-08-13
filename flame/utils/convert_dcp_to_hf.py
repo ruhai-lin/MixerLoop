@@ -25,7 +25,7 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 import custom_models  # noqa: F401, registers MixerLoop with Transformers
 
 CHECKPOINT_MAGIC = 0x47444E65  # "GDNe", little-endian
-CHECKPOINT_VERSION = 3
+CHECKPOINT_VERSION = 2
 CHECKPOINT_HEADER_BYTES = 256
 QUANT_GROUP_SIZE = 32
 
@@ -66,7 +66,7 @@ def export_q8_checkpoint(
     output_path: str | os.PathLike[str],
     group_size: int = QUANT_GROUP_SIZE,
 ) -> Path:
-    """Write the version-3 public checkpoint consumed by ``hardware/``."""
+    """Write the canonical GDNe v2 checkpoint consumed by ``hardware/``."""
 
     config = model.config
     if config.model_type != "mixerloop":
@@ -76,10 +76,6 @@ def export_q8_checkpoint(
     if config.hidden_size != config.num_heads * config.head_dim:
         raise ValueError("the hardware profile requires hidden_size == num_heads * head_dim")
 
-    loop_count = int(config.loop_count)
-    use_residual = bool(config.use_residual)
-    if not 1 <= loop_count <= 4:
-        raise ValueError(f"hardware supports loop_count in [1, 4], got {loop_count}")
     tied = bool(config.tie_word_embeddings)
     if not tied:
         raise ValueError("the hardware profile requires tied input and output embeddings")
@@ -88,7 +84,7 @@ def export_q8_checkpoint(
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("wb") as handle:
         header = struct.pack(
-            "<I15i",
+            "<I13i",
             CHECKPOINT_MAGIC,
             CHECKPOINT_VERSION,
             int(config.hidden_size),
@@ -101,10 +97,8 @@ def export_q8_checkpoint(
             int(config.vocab_size),
             int(config.max_position_embeddings),
             int(tied),
-            loop_count,
-            int(use_residual),
-            group_size,
             0,
+            group_size,
         )
         handle.write(header)
         handle.write(bytes(CHECKPOINT_HEADER_BYTES - len(header)))
@@ -133,13 +127,6 @@ def export_q8_checkpoint(
             _write_q8(handle, ffn.down_proj.weight, group_size)
             _write_q8(handle, ffn.up_proj.weight, group_size)
         _write_fp32(handle, core.norm.weight)
-        if use_residual:
-            if core.residual_weight is None or tuple(core.residual_weight.shape) != (
-                loop_count,
-                config.hidden_size,
-            ):
-                raise ValueError("residual_weight does not match the resolved loop configuration")
-            _write_fp32(handle, core.residual_weight)
 
     logger.info(f"Saved hardware Q8 checkpoint to {output}")
     return output
@@ -197,7 +184,7 @@ def save_pretrained(path: str, step: int, config: str, tokenizer: str) -> None:
 
         model_config.save_pretrained(output)
         model.save_pretrained(output)
-        export_q8_checkpoint(model, output / "model.q8.bin")
+        export_q8_checkpoint(model, output / f"{output.name}_q8.bin")
 
     tokenizer_model = Path(tokenizer) / "tokenizer.model"
     if not tokenizer_model.is_file():

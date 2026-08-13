@@ -21,8 +21,7 @@ class MixerLoopConfig(PretrainedConfig):
         conv_size: int = 4,
         attn_mode: str = 'chunk',
         loop_count: int = 4,
-        use_residual: bool = True,
-        max_position_embeddings: int = 1024,
+        max_position_embeddings: int = 256,
         hidden_act: str = 'swish',
         initializer_range: float = 0.02,
         norm_eps: float = 1e-5,
@@ -48,9 +47,8 @@ class MixerLoopConfig(PretrainedConfig):
         self.conv_size = conv_size
         self.attn_mode = attn_mode
         self.loop_count = loop_count
-        if self.loop_count < 1:
-            raise ValueError(f'loop_count must be at least 1, got {self.loop_count}')
-        self.use_residual = use_residual
+        if not 1 <= self.loop_count <= 4:
+            raise ValueError(f'loop_count must be between 1 and 4, got {self.loop_count}')
         self.max_position_embeddings = max_position_embeddings
         self.hidden_act = hidden_act
         self.initializer_range = initializer_range

@@ -47,19 +47,15 @@ class MixerLoopBlock(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        residual_weight: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         h = hidden_states
-        for loop_idx in range(self.loop_count):
-            h_input = h
+        for _ in range(self.loop_count):
             attn_out, _, _ = self.mixer(
                 self.attn_norm(h),
                 attention_mask=attention_mask,
                 **kwargs,
             )
             h = h + attn_out
-            if residual_weight is not None:
-                h = h + residual_weight[loop_idx].view(1, 1, -1) * h_input
         return h + self.ffn(self.ffn_norm(h))
