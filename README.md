@@ -87,10 +87,10 @@ Run short T=1 and T=4 smoke jobs:
 source .venv/bin/activate
 
 LOOP_COUNT=1 STEPS=1000 NGPU=1 MICRO_BATCH=1 GLOBAL_BATCH=8 \
-  OUTPUT=outputs/tinystories-15m-t1 bash train.sh
+  OUTPUT=outputs/tinystories15M_t1 bash train.sh
 
 LOOP_COUNT=4 STEPS=1000 NGPU=1 MICRO_BATCH=1 GLOBAL_BATCH=8 \
-  OUTPUT=outputs/tinystories-15m-t4 bash train.sh
+  OUTPUT=outputs/tinystories15M_t4 bash train.sh
 ```
 
 For a very short pipeline check, set `STEPS=1 GLOBAL_BATCH=1 SEQ_LEN=64`.
@@ -101,7 +101,7 @@ Common overrides include `DATASET`, `DATASET_REVISION`, `DATASET_SPLIT`,
 Each output directory is self-contained:
 
 ```text
-outputs/tinystories-15m-t4/
+outputs/tinystories15M_t4/
 ├── checkpoint/step-1000/     # resumable Flame/TorchTitan DCP
 ├── config.json               # resolved HF config (including T)
 ├── model.safetensors         # full-precision HF checkpoint
@@ -118,8 +118,8 @@ Load a produced HF checkpoint after the package has registered MixerLoop:
 import custom_models  # registers the architecture with Transformers
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-model = AutoModelForCausalLM.from_pretrained("outputs/tinystories-15m-t4")
-tokenizer = AutoTokenizer.from_pretrained("outputs/tinystories-15m-t4")
+model = AutoModelForCausalLM.from_pretrained("outputs/tinystories15M_t4")
+tokenizer = AutoTokenizer.from_pretrained("outputs/tinystories15M_t4")
 ```
 
 ## Hardware validation without a board
@@ -132,8 +132,8 @@ cmake -S hardware -B hardware/outputs/cpu
 cmake --build hardware/outputs/cpu -j
 
 bash hardware/scripts/build_sim.sh
-hardware/outputs/sim/kernel_sim outputs/tinystories-15m-t1/model.q8.bin 8
-hardware/outputs/sim/kernel_sim outputs/tinystories-15m-t4/model.q8.bin 8
+hardware/outputs/sim/kernel_sim outputs/tinystories15M_t1/model.q8.bin 8
+hardware/outputs/sim/kernel_sim outputs/tinystories15M_t4/model.q8.bin 8
 
 source /opt/xilinx/2025.2/Vitis/settings64.sh
 bash hardware/scripts/build_hls.sh
@@ -157,8 +157,8 @@ python -m flame.datasets.climbmix --data_dir data/climbmix-10b
 CORE and lm-eval entry points remain available:
 
 ```bash
-python eval/core_eval.py --model_path outputs/tinystories-15m-t4
-python eval/harness_eval.py --model_path outputs/tinystories-15m-t4
+python eval/core_eval.py --model_path outputs/tinystories15M_t4
+python eval/harness_eval.py --model_path outputs/tinystories15M_t4
 ```
 
 ### AAAI paper milestone
