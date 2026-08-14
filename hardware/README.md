@@ -44,6 +44,7 @@ src/config.hpp       fixed profile and packed tensor offsets
 src/weight.cpp       version-2 Q8 loader and 512-bit host packing
 src/decode.cpp       HLS kernel plus matching CPU Q8 reference
 src/main.cpp         CPU/XRT host
+model/               canonical TinyStories T=1 and T=4 GDNe v2 weights
 tools/kernel_sim.cpp synthesizable kernel versus CPU reference
 scripts/             build, link, package, and optional deployment helpers
 ```

@@ -10,6 +10,7 @@ repos:
   - id: check-toml
   - id: check-ast
   - id: check-added-large-files
+    exclude: ^hardware/model/tinystories15m_t[14]_q8\.bin$
   - id: check-merge-conflict
   - id: detect-private-key
   - id: debug-statements

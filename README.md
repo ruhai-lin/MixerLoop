@@ -113,7 +113,7 @@ The canonical comparison weights are stored as:
 
 ```text
 hardware/model/tinystories15m_t1_q8.bin
-hardware/model/tinystories15m_t4_q8.bin  # added after the full T=4 run
+hardware/model/tinystories15m_t4_q8.bin
 ```
 
 See `hardware/README.md` for the accelerator and toolchain details.
