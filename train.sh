@@ -21,9 +21,11 @@ MICRO_BATCH=${MICRO_BATCH:-1}
 GLOBAL_BATCH=${GLOBAL_BATCH:-512}
 SEED=${SEED:-1337}
 DATASET=${DATASET:-roneneldan/TinyStories}
+DATASET_NAME=${DATASET_NAME:-}
 DATASET_SPLIT=${DATASET_SPLIT:-train}
 DATASET_REVISION=${DATASET_REVISION:-f54c09fd23315a6f9c86f9dc80f725de7d8f9c64}
 TOKENIZER=${TOKENIZER:-assets/tokenizer}
+MODEL_CONFIG=${MODEL_CONFIG:-configs/mixerloop_15m.json}
 OUTPUT=${OUTPUT:-outputs/tinystories15m_t${LOOP_COUNT}}
 NUM_WORKERS=${NUM_WORKERS:-0}
 CHECKPOINT_INTERVAL=${CHECKPOINT_INTERVAL:-2000}
@@ -46,7 +48,7 @@ fi
 train_args=(
   --job.config_file flame/models/fla.toml
   --job.dump_folder "$OUTPUT"
-  --model.config configs/mixerloop_15m.json
+  --model.config "$MODEL_CONFIG"
   --model.tokenizer_path "$TOKENIZER"
   --model.loop_count "$LOOP_COUNT"
   --optimizer.name AdamW
@@ -82,6 +84,9 @@ train_args=(
   --checkpoint.load_step -1
   --metrics.log_freq "${LOG_FREQ:-20}"
 )
+if [[ -n "$DATASET_NAME" ]]; then
+  train_args+=(--training.dataset_name "$DATASET_NAME")
+fi
 if [[ "${WANDB:-0}" == "1" ]]; then
   train_args+=(--metrics.enable_wandb)
 fi

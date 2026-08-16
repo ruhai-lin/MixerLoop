@@ -6,11 +6,26 @@ import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoModelForCausalLM
+from transformers import AutoConfig, AutoModelForCausalLM
 
 import custom_models  # noqa: F401
 from custom_models.mixerloop import MixerLoopConfig
 from custom_models.mixerloop.layers import MixerLoopBlock
+
+
+@pytest.mark.parametrize(
+    ("config_path", "expected_parameters"),
+    [
+        ("configs/mixerloop_15m.json", 15_594_112),
+        ("configs/mixerloop_105m.json", 105_031_680),
+        ("configs/mixerloop_328m.json", 327_969_664),
+    ],
+)
+def test_shipped_config_parameter_counts(config_path, expected_parameters):
+    config = AutoConfig.from_pretrained(config_path)
+    with torch.device("meta"):
+        model = AutoModelForCausalLM.from_config(config)
+    assert sum(parameter.numel() for parameter in model.parameters()) == expected_parameters
 
 
 def tiny_config(loop_count: int = 4):
