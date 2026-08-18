@@ -34,17 +34,19 @@ namespace {
 constexpr int kVecLanes = 8;
 constexpr int kAccStages = 8;
 constexpr int kHeadGroups = kHeadVDim / kVecLanes;
-constexpr int kSWords = kNumLayers * kNumHeads * kHeadKDim * kHeadGroups;
+constexpr int kSWords =
+    kMaxLoopCount * kNumLayers * kNumHeads * kHeadKDim * kHeadGroups;
 constexpr int kConvKinds = 3;
 constexpr int kScratchDepth = 12288;
 constexpr int kScratchBanks = 8;
 constexpr int kMixerCacheBase = 0;
-constexpr int kMixerCacheWords = 5760; // scratch[0, 5759]: current-layer mixer
+// Frozen Mixer Q8 cache: scratch[0, 5759], 8×64-bit banks, 24 URAM.
+// loop0 writes all 5760 words; loop1–3 read 512 bit/cycle from the same window.
+constexpr int kMixerCacheWords = kPackedQKVGWords + kPackedProjWords;
 constexpr int kQkvgRows = 2 * (kHeadKDim + kHeadVDim);
-constexpr int kMemCmdsPerToken = 1 + kNumLayers * 4 + 2;
-constexpr int kScratchCmdsPerToken = kNumLayers * 3;
-constexpr int kRouteCmdsPerToken = kNumLayers * 4 + 1;
-constexpr int kQ8CmdsPerToken = kNumLayers * 4 + 1;
+static_assert(kMixerCacheWords == 5760, "Mixer cache must be 5760 packed words");
+static_assert(kScratchBanks == 8, "Mixer scratch is 8×64-bit");
+static_assert(kMixerCacheBase == 0, "Mixer cache occupies scratch[0, 5759]");
 
 using ParameterBeat = ap_uint<128>;
 using ParameterWord = ap_uint<512>;
@@ -62,9 +64,26 @@ struct ActPkt {
   float scale;
 };
 
-using ConvHist = ConvWord[kNumLayers][kConvKinds][kKeyDim];
+using ConvHist = ConvWord[kNumLayers][kMaxLoopCount][kConvKinds][kKeyDim];
 using StateMem = StateBank[4][kSWords];
 using ScratchMem = StateBank[kScratchBanks][kScratchDepth];
+
+enum TokenPhase {
+  kPhaseBegin = 0,
+  kPhaseLayer,
+  kPhaseLm,
+  kPhaseEnd
+};
+enum WeightKind {
+  kWeightNone = 0,
+  kWeightMixerQkvg,
+  kWeightMixerO,
+  kWeightW13,
+  kWeightW2,
+  kWeightLm
+};
+enum WeightSrc { kSrcAxi = 0, kSrcSram };
+enum WeightDst { kDstNone = 0, kDstQ8, kDstScratch, kDstQ8AndScratch };
 
 enum MemKind {
   kMemEmbed = 0,
@@ -76,28 +95,80 @@ enum MemKind {
   kMemStore
 };
 enum ScratchKind { kScratchFill = 0, kScratchRead };
-enum RouteSrc { kSrcAxi = 0, kSrcSram };
 enum Q8Kind { kQ8Qkvg = 0, kQ8O, kQ8W13, kQ8W2, kQ8Lm };
+enum PostKind {
+  kPostEmbed = 0,
+  kPostAttn,
+  kPostPackO,
+  kPostResO,
+  kPostFfn,
+  kPostW13,
+  kPostResW2,
+  kPostFinal
+};
+
+struct CmdHeader {
+  unsigned char phase;
+  unsigned char layer_id;
+  unsigned char loop_id;
+  unsigned char weight_kind;
+  unsigned char source;
+  unsigned char destination;
+};
 
 struct MemCmd {
+  CmdHeader hdr;
   unsigned char kind;
-  unsigned char layer;
   int token;
 };
 struct ScratchCmd {
+  CmdHeader hdr;
   unsigned char kind;
   int addr;
   int count;
 };
 struct RouteCmd {
-  unsigned char src;
+  CmdHeader hdr;
   int count;
 };
 struct Q8Cmd {
+  CmdHeader hdr;
   unsigned char kind;
   unsigned short rows;
   unsigned char groups;
 };
+struct StageCmd {
+  CmdHeader hdr;
+};
+struct PostCmd {
+  CmdHeader hdr;
+  unsigned char kind;
+};
+
+static CmdHeader make_hdr(unsigned char phase, unsigned char layer,
+                          unsigned char loop, unsigned char weight_kind,
+                          unsigned char source, unsigned char destination) {
+#pragma HLS INLINE
+  CmdHeader hdr;
+  hdr.phase = phase;
+  hdr.layer_id = layer;
+  hdr.loop_id = loop;
+  hdr.weight_kind = weight_kind;
+  hdr.source = source;
+  hdr.destination = destination;
+  return hdr;
+}
+
+static int clamp_loop_count(int loop_count) {
+#pragma HLS INLINE
+  if (loop_count < 1) {
+    return 1;
+  }
+  if (loop_count > kMaxLoopCount) {
+    return kMaxLoopCount;
+  }
+  return loop_count;
+}
 
 static inline uint32_t float_to_bits(float value) {
   union {
@@ -208,9 +279,11 @@ static inline float sfu_rsqrt(float x) {
   return sfu_recip(sfu_sqrt(x));
 }
 
-static inline int state_addr(int layer, int head, int row, int group) {
+static inline int state_addr(int loop, int layer, int head, int row, int group) {
 #pragma HLS INLINE
-  return ((layer * kNumHeads + head) * kHeadKDim + row) * kHeadGroups + group;
+  return (((loop * kNumLayers + layer) * kNumHeads + head) * kHeadKDim + row) *
+         kHeadGroups +
+         group;
 }
 
 static inline StateBank pack2(float a, float b) {
@@ -577,7 +650,7 @@ static float fp8_dot(const float* a, const float* b, int size) {
   return reduce8(acc);
 }
 
-static void fp8_conv(float* channels, ConvHist hist, int layer, int kind,
+static void fp8_conv(float* channels, ConvHist hist, int layer, int loop, int kind,
                      int channel_base,
                      const float weight[kConvKinds][kKeyDim][kConvSize],
                      int count, bool valid) {
@@ -586,7 +659,7 @@ static void fp8_conv(float* channels, ConvHist hist, int layer, int kind,
 #pragma HLS PIPELINE II = 1
     const int ch = channel_base + c;
     float h0, h1, h2;
-    unpack3(hist[layer][kind][ch], h0, h1, h2);
+    unpack3(hist[layer][loop][kind][ch], h0, h1, h2);
     const float t0 = valid ? h0 : 0.0f;
     const float t1 = valid ? h1 : 0.0f;
     const float t2 = valid ? h2 : 0.0f;
@@ -595,7 +668,7 @@ static void fp8_conv(float* channels, ConvHist hist, int layer, int kind,
         fadd(fadd(fmul(t0, weight[kind][ch][0]), fmul(t1, weight[kind][ch][1])),
              fadd(fmul(t2, weight[kind][ch][2]), fmul(t3, weight[kind][ch][3])));
     channels[c] = sum;
-    hist[layer][kind][ch] = pack3(t1, t2, t3);
+    hist[layer][loop][kind][ch] = pack3(t1, t2, t3);
   }
   for (int c = 0; c < count; ++c) {
     channels[c] = sfu_silu(channels[c]);
@@ -623,7 +696,7 @@ static void fp8_l2scale(float* x, int size, float extra_scale) {
   }
 }
 
-static void fp8_recurrence(StateMem S, int layer, int head, const float* q,
+static void fp8_recurrence(StateMem S, int loop, int layer, int head, const float* q,
                            const float* k, const float* v, float beta,
                            float decay, bool valid, float* out) {
 #pragma HLS INLINE
@@ -640,7 +713,7 @@ static void fp8_recurrence(StateMem S, int layer, int head, const float* q,
 #pragma HLS PIPELINE II = 1
 #pragma HLS DEPENDENCE variable = acc inter false
       const int stage = i & (kAccStages - 1);
-      const int addr = state_addr(layer, head, i, g);
+      const int addr = state_addr(loop, layer, head, i, g);
       float lane[kVecLanes];
 #pragma HLS ARRAY_PARTITION variable = lane complete dim = 1
       s_load(S, addr, lane);
@@ -671,7 +744,7 @@ static void fp8_recurrence(StateMem S, int layer, int head, const float* q,
 #pragma HLS PIPELINE II = 1
 #pragma HLS DEPENDENCE variable = acc inter false
       const int stage = i & (kAccStages - 1);
-      const int addr = state_addr(layer, head, i, g);
+      const int addr = state_addr(loop, layer, head, i, g);
       float lane[kVecLanes];
 #pragma HLS ARRAY_PARTITION variable = lane complete dim = 1
       s_load(S, addr, lane);
@@ -737,96 +810,198 @@ static void fp8_beta_decay(const float* norm, const float* b_proj,
       a_decay, sfu_softplus(fadd(fp8_dot(norm, a_proj, kDim), dt_bias))));
 }
 
-static void controller(int token, int reset_state, hls::stream<MemCmd>& mem_cmds,
+static void write_end(hls::stream<MemCmd>& mem_cmds,
+                      hls::stream<ScratchCmd>& scratch_cmds,
+                      hls::stream<RouteCmd>& route_cmds,
+                      hls::stream<Q8Cmd>& q8_cmds, hls::stream<StageCmd>& beta_cmds,
+                      hls::stream<StageCmd>& conv_cmds,
+                      hls::stream<StageCmd>& rec_cmds, hls::stream<PostCmd>& post_cmds) {
+#pragma HLS INLINE
+  const CmdHeader end = make_hdr(kPhaseEnd, 0, 0, kWeightNone, kSrcAxi, kDstNone);
+  MemCmd mem;
+  mem.hdr = end;
+  mem.kind = 0;
+  mem.token = 0;
+  mem_cmds.write(mem);
+  ScratchCmd sc;
+  sc.hdr = end;
+  sc.kind = 0;
+  sc.addr = 0;
+  sc.count = 0;
+  scratch_cmds.write(sc);
+  RouteCmd rt;
+  rt.hdr = end;
+  rt.count = 0;
+  route_cmds.write(rt);
+  Q8Cmd q8;
+  q8.hdr = end;
+  q8.kind = 0;
+  q8.rows = 0;
+  q8.groups = 0;
+  q8_cmds.write(q8);
+  StageCmd st;
+  st.hdr = end;
+  beta_cmds.write(st);
+  conv_cmds.write(st);
+  rec_cmds.write(st);
+  PostCmd post;
+  post.hdr = end;
+  post.kind = 0;
+  post_cmds.write(post);
+}
+
+static void controller(int token, int reset_state, int loop_count,
+                       hls::stream<MemCmd>& mem_cmds,
                        hls::stream<ScratchCmd>& scratch_cmds,
                        hls::stream<RouteCmd>& route_cmds,
-                       hls::stream<Q8Cmd>& q8_cmds, hls::stream<int>& conv_reset,
-                       hls::stream<int>& rec_reset) {
+                       hls::stream<Q8Cmd>& q8_cmds, hls::stream<StageCmd>& beta_cmds,
+                       hls::stream<StageCmd>& conv_cmds,
+                       hls::stream<StageCmd>& rec_cmds, hls::stream<PostCmd>& post_cmds,
+                       hls::stream<int>& conv_reset, hls::stream<int>& rec_reset) {
 #pragma HLS INLINE off
+  const int loops = clamp_loop_count(loop_count);
   conv_reset.write(reset_state);
   rec_reset.write(reset_state);
 
   MemCmd mem;
+  mem.hdr = make_hdr(kPhaseBegin, 0, 0, kWeightNone, kSrcAxi, kDstNone);
   mem.kind = kMemEmbed;
-  mem.layer = 0;
   mem.token = token;
   mem_cmds.write(mem);
+  PostCmd post;
+  post.hdr = mem.hdr;
+  post.kind = kPostEmbed;
+  post_cmds.write(post);
 
   for (int layer = 0; layer < kNumLayers; ++layer) {
 #pragma HLS LOOP_TRIPCOUNT min = 8 max = 8
-    mem.kind = kMemSide;
-    mem.layer = static_cast<unsigned char>(layer);
-    mem_cmds.write(mem);
+    const unsigned char layer_id = static_cast<unsigned char>(layer);
 
-    mem.kind = kMemFill;
-    mem_cmds.write(mem);
+    for (int loop_i = 0; loop_i < loops; ++loop_i) {
+#pragma HLS LOOP_TRIPCOUNT min = 1 max = 4
+      const unsigned char loop = static_cast<unsigned char>(loop_i);
+      const unsigned char src = loop_i == 0 ? kSrcAxi : kSrcSram;
+      const unsigned char mix_dst = loop_i == 0 ? kDstQ8AndScratch : kDstQ8;
 
-    ScratchCmd sc;
-    sc.kind = kScratchFill;
-    sc.addr = kMixerCacheBase;
-    sc.count = kMixerCacheWords;
-    scratch_cmds.write(sc);
+      mem.hdr = make_hdr(kPhaseLayer, layer_id, loop, kWeightNone, kSrcAxi, kDstNone);
+      mem.kind = kMemSide;
+      mem_cmds.write(mem);
 
-    sc.kind = kScratchRead;
-    sc.addr = 0;
-    sc.count = kPackedQKVGWords;
-    scratch_cmds.write(sc);
+      ScratchCmd sc;
+      sc.hdr = make_hdr(kPhaseLayer, layer_id, loop, kWeightMixerQkvg, src, mix_dst);
+      if (loop_i == 0) {
+        mem.hdr = sc.hdr;
+        mem.kind = kMemFill;
+        mem_cmds.write(mem);
+        sc.kind = kScratchFill;
+        sc.addr = kMixerCacheBase;
+        sc.count = kMixerCacheWords;
+        scratch_cmds.write(sc);
+      } else {
+        sc.kind = kScratchRead;
+        sc.addr = kMixerCacheBase;
+        sc.count = kPackedQKVGWords;
+        scratch_cmds.write(sc);
+      }
 
-    RouteCmd rt;
-    rt.src = kSrcSram;
-    rt.count = kPackedQKVGWords;
-    route_cmds.write(rt);
+      StageCmd st;
+      st.hdr = make_hdr(kPhaseLayer, layer_id, loop, kWeightNone, kSrcAxi, kDstNone);
+      beta_cmds.write(st);
+      conv_cmds.write(st);
+      rec_cmds.write(st);
+      post.hdr = st.hdr;
+      post.kind = kPostAttn;
+      post_cmds.write(post);
 
-    Q8Cmd q8;
-    q8.kind = kQ8Qkvg;
-    q8.rows = kQkvgRows;
-    q8.groups = kDimGroups;
-    q8_cmds.write(q8);
+      RouteCmd rt;
+      rt.hdr = make_hdr(kPhaseLayer, layer_id, loop, kWeightMixerQkvg, src, kDstQ8);
+      rt.count = kPackedQKVGWords;
+      route_cmds.write(rt);
+      Q8Cmd q8;
+      q8.hdr = rt.hdr;
+      q8.kind = kQ8Qkvg;
+      q8.rows = kQkvgRows;
+      q8.groups = kDimGroups;
+      q8_cmds.write(q8);
 
-    sc.addr = kPackedQKVGWords;
-    sc.count = kPackedProjWords;
-    scratch_cmds.write(sc);
-    rt.count = kPackedProjWords;
-    route_cmds.write(rt);
-    q8.kind = kQ8O;
-    q8.rows = kDim;
-    q8.groups = kValueGroups;
-    q8_cmds.write(q8);
+      post.kind = kPostPackO;
+      post_cmds.write(post);
+      if (loop_i != 0) {
+        sc.hdr = make_hdr(kPhaseLayer, layer_id, loop, kWeightMixerO, src, kDstQ8);
+        sc.kind = kScratchRead;
+        sc.addr = kPackedQKVGWords;
+        sc.count = kPackedProjWords;
+        scratch_cmds.write(sc);
+      }
+      rt.hdr = make_hdr(kPhaseLayer, layer_id, loop, kWeightMixerO, src, kDstQ8);
+      rt.count = kPackedProjWords;
+      route_cmds.write(rt);
+      q8.hdr = rt.hdr;
+      q8.kind = kQ8O;
+      q8.rows = kDim;
+      q8.groups = kValueGroups;
+      q8_cmds.write(q8);
+      post.kind = kPostResO;
+      post_cmds.write(post);
+    }
 
+    mem.hdr = make_hdr(kPhaseLayer, layer_id, 0, kWeightW13, kSrcAxi, kDstQ8);
     mem.kind = kMemW13;
     mem_cmds.write(mem);
-    rt.src = kSrcAxi;
+    RouteCmd rt;
+    rt.hdr = mem.hdr;
     rt.count = 2 * kPackedW13Words;
     route_cmds.write(rt);
+    Q8Cmd q8;
+    q8.hdr = mem.hdr;
     q8.kind = kQ8W13;
     q8.rows = kHiddenDim;
     q8.groups = kDimGroups;
     q8_cmds.write(q8);
+    post.hdr = mem.hdr;
+    post.kind = kPostFfn;
+    post_cmds.write(post);
+    post.kind = kPostW13;
+    post_cmds.write(post);
 
+    mem.hdr = make_hdr(kPhaseLayer, layer_id, 0, kWeightW2, kSrcAxi, kDstQ8);
     mem.kind = kMemW2;
     mem_cmds.write(mem);
+    rt.hdr = mem.hdr;
     rt.count = kPackedW2Words;
     route_cmds.write(rt);
+    q8.hdr = mem.hdr;
     q8.kind = kQ8W2;
     q8.rows = kDim;
     q8.groups = kHiddenGroups;
     q8_cmds.write(q8);
+    post.hdr = mem.hdr;
+    post.kind = kPostResW2;
+    post_cmds.write(post);
   }
 
+  mem.hdr = make_hdr(kPhaseLm, 0, 0, kWeightLm, kSrcAxi, kDstQ8);
   mem.kind = kMemLm;
-  mem.layer = 0;
   mem_cmds.write(mem);
   RouteCmd rt;
-  rt.src = kSrcAxi;
+  rt.hdr = mem.hdr;
   rt.count = kPackedTokWords;
   route_cmds.write(rt);
   Q8Cmd q8;
+  q8.hdr = mem.hdr;
   q8.kind = kQ8Lm;
   q8.rows = kVocabSize;
   q8.groups = kDimGroups;
   q8_cmds.write(q8);
+  post.hdr = make_hdr(kPhaseLm, 0, 0, kWeightNone, kSrcAxi, kDstNone);
+  post.kind = kPostFinal;
+  post_cmds.write(post);
+  mem.hdr = make_hdr(kPhaseLm, 0, 0, kWeightNone, kSrcAxi, kDstNone);
   mem.kind = kMemStore;
   mem_cmds.write(mem);
+
+  write_end(mem_cmds, scratch_cmds, route_cmds, q8_cmds, beta_cmds, conv_cmds,
+            rec_cmds, post_cmds);
 }
 
 static void axi_words(hls::stream<ParameterWord>& dst, const ParameterBeat* params,
@@ -835,6 +1010,18 @@ static void axi_words(hls::stream<ParameterWord>& dst, const ParameterBeat* para
   for (int it = 0; it < count; ++it) {
 #pragma HLS PIPELINE II = 4
     dst.write(read_word(params, offset + it));
+  }
+}
+
+static void axi_broadcast(hls::stream<ParameterWord>& to_q8,
+                          hls::stream<ParameterWord>& to_scratch,
+                          const ParameterBeat* params, int offset, int count) {
+#pragma HLS INLINE
+  for (int it = 0; it < count; ++it) {
+#pragma HLS PIPELINE II = 4
+    const ParameterWord word = read_word(params, offset + it);
+    to_q8.write(word);
+    to_scratch.write(word);
   }
 }
 
@@ -871,16 +1058,21 @@ static void memory_process(const ParameterBeat* params, const float* side,
                            hls::stream<ParameterWord>& axi_out,
                            hls::stream<uint32_t>& lm_token) {
 #pragma HLS INLINE off
-  for (int i = 0; i < kMemCmdsPerToken; ++i) {
-#pragma HLS LOOP_TRIPCOUNT min = 35 max = 35
+  for (;;) {
+#pragma HLS LOOP_TRIPCOUNT min = 36 max = 36
     const MemCmd cmd = cmds.read();
-    const int layer = cmd.layer;
+    if (cmd.hdr.phase == kPhaseEnd) {
+      break;
+    }
+    const int layer = cmd.hdr.layer_id;
     if (cmd.kind == kMemEmbed) {
       load_embedding(embed, params, cmd.token);
       stream_write_vec(rms_final, side + kSideRmsFinalOffset, kDim);
     } else if (cmd.kind == kMemSide) {
       stream_write_vec(rms_att, side + SideRmsAttOffset(layer), kDim);
-      stream_write_vec(rms_ffn, side + SideRmsFfnOffset(layer), kDim);
+      if (cmd.hdr.loop_id == 0) {
+        stream_write_vec(rms_ffn, side + SideRmsFfnOffset(layer), kDim);
+      }
       stream_write_vec(beta_side, side + SideAProjOffset(layer),
                        kAProjSize + kBProjSize);
       stream_write_vec(beta_side, side + SideAOffset(layer), 2 * kNumHeads);
@@ -888,7 +1080,9 @@ static void memory_process(const ParameterBeat* params, const float* side,
                        kQConvSize + kKConvSize + kVConvSize);
       stream_write_vec(o_norm, side + SideONormOffset(layer), kHeadVDim);
     } else if (cmd.kind == kMemFill) {
-      axi_words(fill_words, params, PackedQOffset(layer, 0), kMixerCacheWords);
+      // Loop0: one HP0 512b word feeds Q8 and Mixer scratch together.
+      axi_broadcast(axi_out, fill_words, params, PackedQOffset(layer, 0),
+                    kMixerCacheWords);
     } else if (cmd.kind == kMemW13) {
       axi_words(axi_out, params, PackedW13Offset(layer), 2 * kPackedW13Words);
     } else if (cmd.kind == kMemW2) {
@@ -909,9 +1103,12 @@ static void scratch_process(hls::stream<ScratchCmd>& cmds,
 #pragma HLS BIND_STORAGE variable = scratch type = ram_s2p impl = uram
 #pragma HLS ARRAY_PARTITION variable = scratch complete dim = 1
 
-  for (int i = 0; i < kScratchCmdsPerToken; ++i) {
-#pragma HLS LOOP_TRIPCOUNT min = 24 max = 24
+  for (;;) {
+#pragma HLS LOOP_TRIPCOUNT min = 25 max = 25
     const ScratchCmd cmd = cmds.read();
+    if (cmd.hdr.phase == kPhaseEnd) {
+      break;
+    }
     if (cmd.kind == kScratchFill) {
       for (int it = 0; it < cmd.count; ++it) {
 #pragma HLS PIPELINE II = 1
@@ -931,10 +1128,13 @@ static void weight_router(hls::stream<RouteCmd>& cmds,
                           hls::stream<ParameterWord>& sram_words,
                           hls::stream<ParameterWord>& weights) {
 #pragma HLS INLINE off
-  for (int i = 0; i < kRouteCmdsPerToken; ++i) {
-#pragma HLS LOOP_TRIPCOUNT min = 33 max = 33
+  for (;;) {
+#pragma HLS LOOP_TRIPCOUNT min = 34 max = 34
     const RouteCmd cmd = cmds.read();
-    if (cmd.src == kSrcSram) {
+    if (cmd.hdr.phase == kPhaseEnd) {
+      break;
+    }
+    if (cmd.hdr.source == kSrcSram) {
       for (int it = 0; it < cmd.count; ++it) {
 #pragma HLS PIPELINE II = 1
         weights.write(sram_words.read());
@@ -956,9 +1156,12 @@ static void q8_process(hls::stream<Q8Cmd>& cmds, hls::stream<ParameterWord>& wei
   float buf[2 * kHiddenDim];
 #pragma HLS ARRAY_PARTITION variable = buf cyclic factor = 2 dim = 1
 
-  for (int i = 0; i < kQ8CmdsPerToken; ++i) {
-#pragma HLS LOOP_TRIPCOUNT min = 33 max = 33
+  for (;;) {
+#pragma HLS LOOP_TRIPCOUNT min = 34 max = 34
     const Q8Cmd cmd = cmds.read();
+    if (cmd.hdr.phase == kPhaseEnd) {
+      break;
+    }
     const bool paired = cmd.kind == kQ8W13;
     const bool argmax_mode = cmd.kind == kQ8Lm;
     const int repeats = cmd.kind == kQ8Qkvg ? kNumHeads : 1;
@@ -985,11 +1188,16 @@ static void q8_process(hls::stream<Q8Cmd>& cmds, hls::stream<ParameterWord>& wei
   }
 }
 
-static void beta_process(hls::stream<float>& beta_side, hls::stream<float>& attn_norm,
-                         hls::stream<float>& betas) {
+static void beta_process(hls::stream<StageCmd>& cmds, hls::stream<float>& beta_side,
+                         hls::stream<float>& attn_norm, hls::stream<float>& betas) {
 #pragma HLS INLINE off
-  for (int layer = 0; layer < kNumLayers; ++layer) {
-#pragma HLS LOOP_TRIPCOUNT min = 8 max = 8
+  for (;;) {
+#pragma HLS LOOP_TRIPCOUNT min = 8 max = 32
+    const StageCmd cmd = cmds.read();
+    if (cmd.hdr.phase == kPhaseEnd) {
+      break;
+    }
+    (void)cmd;
     float a_proj[kNumHeads][kDim];
     float b_proj[kNumHeads][kDim];
     float a_decay[kNumHeads];
@@ -1022,28 +1230,36 @@ static void beta_process(hls::stream<float>& beta_side, hls::stream<float>& attn
   }
 }
 
-static void conv_process(hls::stream<int>& reset, hls::stream<float>& q_scale_s,
-                         hls::stream<float>& conv_w_s, hls::stream<float>& qkvg,
-                         hls::stream<float>& convd) {
+static void conv_process(hls::stream<StageCmd>& cmds, hls::stream<int>& reset,
+                         hls::stream<float>& q_scale_s, hls::stream<float>& conv_w_s,
+                         hls::stream<float>& qkvg, hls::stream<float>& convd) {
 #pragma HLS INLINE off
   static ConvHist hist;
-  static bool valid[kNumLayers][kNumHeads];
+  static bool valid[kNumLayers][kMaxLoopCount][kNumHeads];
 #pragma HLS BIND_STORAGE variable = hist type = ram_2p impl = bram
 #pragma HLS ARRAY_PARTITION variable = valid complete dim = 0
 
   const int reset_state = reset.read();
   if (reset_state) {
     for (int layer = 0; layer < kNumLayers; ++layer) {
-      for (int head = 0; head < kNumHeads; ++head) {
+      for (int loop = 0; loop < kMaxLoopCount; ++loop) {
+        for (int head = 0; head < kNumHeads; ++head) {
 #pragma HLS UNROLL
-        valid[layer][head] = false;
+          valid[layer][loop][head] = false;
+        }
       }
     }
   }
   const float q_scale = q_scale_s.read();
 
-  for (int layer = 0; layer < kNumLayers; ++layer) {
-#pragma HLS LOOP_TRIPCOUNT min = 8 max = 8
+  for (;;) {
+#pragma HLS LOOP_TRIPCOUNT min = 8 max = 32
+    const StageCmd cmd = cmds.read();
+    if (cmd.hdr.phase == kPhaseEnd) {
+      break;
+    }
+    const int layer = cmd.hdr.layer_id;
+    const int loop = cmd.hdr.loop_id;
     float conv_w[kConvKinds][kKeyDim][kConvSize];
     for (int kind = 0; kind < kConvKinds; ++kind) {
       for (int c = 0; c < kKeyDim; ++c) {
@@ -1064,29 +1280,29 @@ static void conv_process(hls::stream<int>& reset, hls::stream<float>& q_scale_s,
       stream_read_vec(qkvg, v, kHeadVDim);
       stream_read_vec(qkvg, g, kHeadVDim);
       const int base = h * kHeadKDim;
-      const bool seen = valid[layer][h];
-      fp8_conv(q, hist, layer, 0, base, conv_w, kHeadKDim, seen);
-      fp8_conv(k, hist, layer, 1, base, conv_w, kHeadKDim, seen);
-      fp8_conv(v, hist, layer, 2, base, conv_w, kHeadVDim, seen);
+      const bool seen = valid[layer][loop][h];
+      fp8_conv(q, hist, layer, loop, 0, base, conv_w, kHeadKDim, seen);
+      fp8_conv(k, hist, layer, loop, 1, base, conv_w, kHeadKDim, seen);
+      fp8_conv(v, hist, layer, loop, 2, base, conv_w, kHeadVDim, seen);
       fp8_l2scale(q, kHeadKDim, q_scale);
       fp8_l2scale(k, kHeadKDim, 1.0f);
       stream_write_vec(convd, q, kHeadKDim);
       stream_write_vec(convd, k, kHeadKDim);
       stream_write_vec(convd, v, kHeadVDim);
       stream_write_vec(convd, g, kHeadVDim);
-      valid[layer][h] = true;
+      valid[layer][loop][h] = true;
     }
   }
 }
 
-static void rec_process(hls::stream<int>& reset, hls::stream<float>& o_norm_s,
-                        hls::stream<float>& convd, hls::stream<float>& betas,
-                        hls::stream<float>& heads) {
+static void rec_process(hls::stream<StageCmd>& cmds, hls::stream<int>& reset,
+                        hls::stream<float>& o_norm_s, hls::stream<float>& convd,
+                        hls::stream<float>& betas, hls::stream<float>& heads) {
 #pragma HLS INLINE off
 #pragma HLS ALLOCATION operation instances = fmul limit = 16
 #pragma HLS ALLOCATION operation instances = fadd limit = 16
   static StateMem S;
-  static bool valid[kNumLayers][kNumHeads];
+  static bool valid[kNumLayers][kMaxLoopCount][kNumHeads];
 #pragma HLS BIND_STORAGE variable = S type = ram_s2p impl = uram
 #pragma HLS ARRAY_PARTITION variable = S complete dim = 1
 #pragma HLS ARRAY_PARTITION variable = valid complete dim = 0
@@ -1094,15 +1310,23 @@ static void rec_process(hls::stream<int>& reset, hls::stream<float>& o_norm_s,
   const int reset_state = reset.read();
   if (reset_state) {
     for (int layer = 0; layer < kNumLayers; ++layer) {
-      for (int head = 0; head < kNumHeads; ++head) {
+      for (int loop = 0; loop < kMaxLoopCount; ++loop) {
+        for (int head = 0; head < kNumHeads; ++head) {
 #pragma HLS UNROLL
-        valid[layer][head] = false;
+          valid[layer][loop][head] = false;
+        }
       }
     }
   }
 
-  for (int layer = 0; layer < kNumLayers; ++layer) {
-#pragma HLS LOOP_TRIPCOUNT min = 8 max = 8
+  for (;;) {
+#pragma HLS LOOP_TRIPCOUNT min = 8 max = 32
+    const StageCmd cmd = cmds.read();
+    if (cmd.hdr.phase == kPhaseEnd) {
+      break;
+    }
+    const int layer = cmd.hdr.layer_id;
+    const int loop = cmd.hdr.loop_id;
     float o_norm[kHeadVDim];
     stream_read_vec(o_norm_s, o_norm, kHeadVDim);
     for (int h = 0; h < kNumHeads; ++h) {
@@ -1118,20 +1342,21 @@ static void rec_process(hls::stream<int>& reset, hls::stream<float>& o_norm_s,
       stream_read_vec(convd, g, kHeadVDim);
       const float beta = betas.read();
       const float decay = betas.read();
-      fp8_recurrence(S, layer, h, q, k, v, beta, decay, valid[layer][h], out);
+      fp8_recurrence(S, loop, layer, h, q, k, v, beta, decay, valid[layer][loop][h],
+                     out);
       fp8_head_norm_gate(out, g, o_norm);
       stream_write_vec(heads, out, kHeadVDim);
-      valid[layer][h] = true;
+      valid[layer][loop][h] = true;
     }
   }
 }
 
-static void post_process(hls::stream<float>& embed, hls::stream<float>& rms_final,
-                         hls::stream<float>& rms_att, hls::stream<float>& rms_ffn,
-                         hls::stream<float>& rec_heads, hls::stream<float>& o_vec,
-                         hls::stream<float>& w13_vec, hls::stream<float>& w2_vec,
-                         hls::stream<float>& q_scale_s, hls::stream<float>& attn_norm,
-                         hls::stream<ActPkt>& acts) {
+static void post_process(hls::stream<PostCmd>& cmds, hls::stream<float>& embed,
+                         hls::stream<float>& rms_final, hls::stream<float>& rms_att,
+                         hls::stream<float>& rms_ffn, hls::stream<float>& rec_heads,
+                         hls::stream<float>& o_vec, hls::stream<float>& w13_vec,
+                         hls::stream<float>& w2_vec, hls::stream<float>& q_scale_s,
+                         hls::stream<float>& attn_norm, hls::stream<ActPkt>& acts) {
 #pragma HLS INLINE off
 #pragma HLS ALLOCATION operation instances = fmul limit = 16
 #pragma HLS ALLOCATION operation instances = fadd limit = 16
@@ -1143,45 +1368,51 @@ static void post_process(hls::stream<float>& embed, hls::stream<float>& rms_fina
   float weight[kDim];
   ActTable act;
 
-  stream_read_vec(embed, x, kDim);
-  q_scale_s.write(sfu_rsqrt(static_cast<float>(kHeadKDim)));
-
-  for (int layer = 0; layer < kNumLayers; ++layer) {
-#pragma HLS LOOP_TRIPCOUNT min = 8 max = 8
-    stream_read_vec(rms_att, weight, kDim);
-    fp8_rmsnorm(tmp, x, weight, kDim);
-    fp8_quantize(act, tmp, kDim);
-    emit_act(acts, act, kDimGroups);
-    stream_write_vec(attn_norm, tmp, kDim);
-
-    for (int h = 0; h < kNumHeads; ++h) {
-      stream_read_vec(rec_heads, tmp + h * kHeadVDim, kHeadVDim);
+  for (;;) {
+#pragma HLS LOOP_TRIPCOUNT min = 50 max = 50
+    const PostCmd cmd = cmds.read();
+    if (cmd.hdr.phase == kPhaseEnd) {
+      break;
     }
-    fp8_quantize(act, tmp, kValueDim);
-    emit_act(acts, act, kValueGroups);
-
-    stream_read_vec(o_vec, tmp, kDim);
-    fp8_residual(x, tmp, kDim);
-
-    stream_read_vec(rms_ffn, weight, kDim);
-    fp8_rmsnorm(tmp, x, weight, kDim);
-    fp8_quantize(act, tmp, kDim);
-    emit_act(acts, act, kDimGroups);
-
-    stream_read_vec(w13_vec, w1, kHiddenDim);
-    stream_read_vec(w13_vec, w3, kHiddenDim);
-    fp8_w13_fuse(fused, w1, w3);
-    fp8_quantize(act, fused, kHiddenDim);
-    emit_act(acts, act, kHiddenGroups);
-
-    stream_read_vec(w2_vec, tmp, kDim);
-    fp8_residual(x, tmp, kDim);
+    if (cmd.kind == kPostEmbed) {
+      stream_read_vec(embed, x, kDim);
+      q_scale_s.write(sfu_rsqrt(static_cast<float>(kHeadKDim)));
+    } else if (cmd.kind == kPostAttn) {
+      stream_read_vec(rms_att, weight, kDim);
+      fp8_rmsnorm(tmp, x, weight, kDim);
+      fp8_quantize(act, tmp, kDim);
+      emit_act(acts, act, kDimGroups);
+      stream_write_vec(attn_norm, tmp, kDim);
+    } else if (cmd.kind == kPostPackO) {
+      for (int h = 0; h < kNumHeads; ++h) {
+        stream_read_vec(rec_heads, tmp + h * kHeadVDim, kHeadVDim);
+      }
+      fp8_quantize(act, tmp, kValueDim);
+      emit_act(acts, act, kValueGroups);
+    } else if (cmd.kind == kPostResO) {
+      stream_read_vec(o_vec, tmp, kDim);
+      fp8_residual(x, tmp, kDim);
+    } else if (cmd.kind == kPostFfn) {
+      stream_read_vec(rms_ffn, weight, kDim);
+      fp8_rmsnorm(tmp, x, weight, kDim);
+      fp8_quantize(act, tmp, kDim);
+      emit_act(acts, act, kDimGroups);
+    } else if (cmd.kind == kPostW13) {
+      stream_read_vec(w13_vec, w1, kHiddenDim);
+      stream_read_vec(w13_vec, w3, kHiddenDim);
+      fp8_w13_fuse(fused, w1, w3);
+      fp8_quantize(act, fused, kHiddenDim);
+      emit_act(acts, act, kHiddenGroups);
+    } else if (cmd.kind == kPostResW2) {
+      stream_read_vec(w2_vec, tmp, kDim);
+      fp8_residual(x, tmp, kDim);
+    } else {
+      stream_read_vec(rms_final, weight, kDim);
+      fp8_rmsnorm(tmp, x, weight, kDim);
+      fp8_quantize(act, tmp, kDim);
+      emit_act(acts, act, kDimGroups);
+    }
   }
-
-  stream_read_vec(rms_final, weight, kDim);
-  fp8_rmsnorm(tmp, x, weight, kDim);
-  fp8_quantize(act, tmp, kDim);
-  emit_act(acts, act, kDimGroups);
 }
 
 } // namespace
@@ -1191,7 +1422,7 @@ using namespace gdn;
 
 extern "C" {
 
-void decode(int token, int reset_state,
+void decode(int token, int reset_state, int loop_count,
             const ParameterBeat* __restrict packed_params, const float* side,
             uint32_t* next_token) {
 #pragma HLS INTERFACE m_axi port = packed_params bundle = params0 \
@@ -1202,6 +1433,7 @@ void decode(int token, int reset_state,
     num_write_outstanding = 2
 #pragma HLS INTERFACE s_axilite port = token bundle = control
 #pragma HLS INTERFACE s_axilite port = reset_state bundle = control
+#pragma HLS INTERFACE s_axilite port = loop_count bundle = control
 #pragma HLS INTERFACE s_axilite port = packed_params bundle = control
 #pragma HLS INTERFACE s_axilite port = side bundle = control
 #pragma HLS INTERFACE s_axilite port = next_token bundle = control
@@ -1211,6 +1443,10 @@ void decode(int token, int reset_state,
   hls::stream<ScratchCmd> scratch_cmds("scratch_cmds");
   hls::stream<RouteCmd> route_cmds("route_cmds");
   hls::stream<Q8Cmd> q8_cmds("q8_cmds");
+  hls::stream<StageCmd> beta_cmds("beta_cmds");
+  hls::stream<StageCmd> conv_cmds("conv_cmds");
+  hls::stream<StageCmd> rec_cmds("rec_cmds");
+  hls::stream<PostCmd> post_cmds("post_cmds");
   hls::stream<int> conv_reset("conv_reset");
   hls::stream<int> rec_reset("rec_reset");
   hls::stream<float> embed("embed");
@@ -1235,10 +1471,33 @@ void decode(int token, int reset_state,
   hls::stream<float> w13_vec("w13_vec");
   hls::stream<float> w2_vec("w2_vec");
   hls::stream<uint32_t> lm_token("lm_token");
-#pragma HLS STREAM variable = mem_cmds depth = 8
-#pragma HLS STREAM variable = scratch_cmds depth = 8
-#pragma HLS STREAM variable = route_cmds depth = 8
-#pragma HLS STREAM variable = q8_cmds depth = 8
+#ifdef __SYNTHESIS__
+#pragma HLS STREAM variable = mem_cmds depth = 16
+#pragma HLS STREAM variable = scratch_cmds depth = 16
+#pragma HLS STREAM variable = route_cmds depth = 16
+#pragma HLS STREAM variable = q8_cmds depth = 16
+#pragma HLS STREAM variable = beta_cmds depth = 16
+#pragma HLS STREAM variable = conv_cmds depth = 16
+#pragma HLS STREAM variable = rec_cmds depth = 16
+#pragma HLS STREAM variable = post_cmds depth = 16
+#pragma HLS BIND_STORAGE variable = mem_cmds type = fifo impl = srl
+#pragma HLS BIND_STORAGE variable = scratch_cmds type = fifo impl = srl
+#pragma HLS BIND_STORAGE variable = route_cmds type = fifo impl = srl
+#pragma HLS BIND_STORAGE variable = q8_cmds type = fifo impl = srl
+#pragma HLS BIND_STORAGE variable = beta_cmds type = fifo impl = srl
+#pragma HLS BIND_STORAGE variable = conv_cmds type = fifo impl = srl
+#pragma HLS BIND_STORAGE variable = rec_cmds type = fifo impl = srl
+#pragma HLS BIND_STORAGE variable = post_cmds type = fifo impl = srl
+#else
+#pragma HLS STREAM variable = mem_cmds depth = 256
+#pragma HLS STREAM variable = scratch_cmds depth = 256
+#pragma HLS STREAM variable = route_cmds depth = 256
+#pragma HLS STREAM variable = q8_cmds depth = 256
+#pragma HLS STREAM variable = beta_cmds depth = 256
+#pragma HLS STREAM variable = conv_cmds depth = 256
+#pragma HLS STREAM variable = rec_cmds depth = 256
+#pragma HLS STREAM variable = post_cmds depth = 256
+#endif
 #pragma HLS STREAM variable = conv_reset depth = 2
 #pragma HLS STREAM variable = rec_reset depth = 2
 #pragma HLS STREAM variable = embed depth = 256
@@ -1272,23 +1531,25 @@ void decode(int token, int reset_state,
   // One call site per frozen process. Synthesis builds parallel RTL;
   // C simulation uses the thread path below because g++ ignores DATAFLOW.
 #pragma HLS DATAFLOW disable_start_propagation
-  controller(token, reset_state, mem_cmds, scratch_cmds, route_cmds, q8_cmds,
-             conv_reset, rec_reset);
+  controller(token, reset_state, loop_count, mem_cmds, scratch_cmds, route_cmds,
+             q8_cmds, beta_cmds, conv_cmds, rec_cmds, post_cmds, conv_reset,
+             rec_reset);
   memory_process(packed_params, side, next_token, mem_cmds, embed, rms_final,
                  rms_att, rms_ffn, beta_side, conv_w, o_norm, fill_words,
                  axi_words_s, lm_token);
   scratch_process(scratch_cmds, fill_words, sram_words);
   weight_router(route_cmds, axi_words_s, sram_words, weights);
   q8_process(q8_cmds, weights, acts, qkvg, o_vec, w13_vec, w2_vec, lm_token);
-  beta_process(beta_side, attn_norm, betas);
-  conv_process(conv_reset, q_scale, conv_w, qkvg, convd);
-  rec_process(rec_reset, o_norm, convd, betas, rec_heads);
-  post_process(embed, rms_final, rms_att, rms_ffn, rec_heads, o_vec, w13_vec,
-               w2_vec, q_scale, attn_norm, acts);
+  beta_process(beta_cmds, beta_side, attn_norm, betas);
+  conv_process(conv_cmds, conv_reset, q_scale, conv_w, qkvg, convd);
+  rec_process(rec_cmds, rec_reset, o_norm, convd, betas, rec_heads);
+  post_process(post_cmds, embed, rms_final, rms_att, rms_ffn, rec_heads, o_vec,
+               w13_vec, w2_vec, q_scale, attn_norm, acts);
 #else
   std::thread t_ctrl([&] {
-    controller(token, reset_state, mem_cmds, scratch_cmds, route_cmds, q8_cmds,
-               conv_reset, rec_reset);
+    controller(token, reset_state, loop_count, mem_cmds, scratch_cmds, route_cmds,
+               q8_cmds, beta_cmds, conv_cmds, rec_cmds, post_cmds, conv_reset,
+               rec_reset);
   });
   std::thread t_mem([&] {
     memory_process(packed_params, side, next_token, mem_cmds, embed, rms_final,
@@ -1302,13 +1563,15 @@ void decode(int token, int reset_state,
   std::thread t_q8([&] {
     q8_process(q8_cmds, weights, acts, qkvg, o_vec, w13_vec, w2_vec, lm_token);
   });
-  std::thread t_beta([&] { beta_process(beta_side, attn_norm, betas); });
-  std::thread t_conv([&] { conv_process(conv_reset, q_scale, conv_w, qkvg, convd); });
+  std::thread t_beta(
+      [&] { beta_process(beta_cmds, beta_side, attn_norm, betas); });
+  std::thread t_conv(
+      [&] { conv_process(conv_cmds, conv_reset, q_scale, conv_w, qkvg, convd); });
   std::thread t_rec(
-      [&] { rec_process(rec_reset, o_norm, convd, betas, rec_heads); });
+      [&] { rec_process(rec_cmds, rec_reset, o_norm, convd, betas, rec_heads); });
   std::thread t_post([&] {
-    post_process(embed, rms_final, rms_att, rms_ffn, rec_heads, o_vec, w13_vec,
-                 w2_vec, q_scale, attn_norm, acts);
+    post_process(post_cmds, embed, rms_final, rms_att, rms_ffn, rec_heads, o_vec,
+                 w13_vec, w2_vec, q_scale, attn_norm, acts);
   });
   t_ctrl.join();
   t_mem.join();
@@ -1432,7 +1695,9 @@ void ConvStep(float* channels, float* state, const float* weight, int count) {
 
 } // namespace
 
-void CpuForward(RunState& s, const Weights& w, int token, float* logits) {
+void CpuForward(RunState& s, const Weights& w, int token, float* logits,
+                int loop_count) {
+  const int loops = loop_count < 1 ? 1 : (loop_count > kMaxLoopCount ? kMaxLoopCount : loop_count);
   const std::size_t q_base = static_cast<std::size_t>(token) * kDim;
   const std::size_t s_base = static_cast<std::size_t>(token) * kDimGroups;
   for (int i = 0; i < kDim; ++i) {
@@ -1445,75 +1710,74 @@ void CpuForward(RunState& s, const Weights& w, int token, float* logits) {
   for (int layer = 0; layer < kNumLayers; ++layer) {
     const LayerWeights& l = w.layers[layer];
 
-    // Mixer.
-    RmsNorm(s.xb.data(), s.x.data(), l.attn_norm.data(), kDim);
-    Quantize(s.xq_q.data(), s.xq_s.data(), s.xb.data(), kDim);
-    Matmul(s.q.data(), s.xq_q.data(), s.xq_s.data(), l.q_proj);
-    Matmul(s.k.data(), s.xq_q.data(), s.xq_s.data(), l.k_proj);
-    Matmul(s.v.data(), s.xq_q.data(), s.xq_s.data(), l.v_proj);
-    Matmul(s.gate.data(), s.xq_q.data(), s.xq_s.data(), l.g_proj);
+    for (int loop = 0; loop < loops; ++loop) {
+      RmsNorm(s.xb.data(), s.x.data(), l.attn_norm.data(), kDim);
+      Quantize(s.xq_q.data(), s.xq_s.data(), s.xb.data(), kDim);
+      Matmul(s.q.data(), s.xq_q.data(), s.xq_s.data(), l.q_proj);
+      Matmul(s.k.data(), s.xq_q.data(), s.xq_s.data(), l.k_proj);
+      Matmul(s.v.data(), s.xq_q.data(), s.xq_s.data(), l.v_proj);
+      Matmul(s.gate.data(), s.xq_q.data(), s.xq_s.data(), l.g_proj);
 
-    ConvStep(s.q.data(),
-             s.q_conv_state.data() + static_cast<std::size_t>(layer) * kQConvSize,
-             l.q_conv.data(), kKeyDim);
-    ConvStep(s.k.data(),
-             s.k_conv_state.data() + static_cast<std::size_t>(layer) * kKConvSize,
-             l.k_conv.data(), kKeyDim);
-    ConvStep(s.v.data(),
-             s.v_conv_state.data() + static_cast<std::size_t>(layer) * kVConvSize,
-             l.v_conv.data(), kValueDim);
+      const std::size_t slot =
+          static_cast<std::size_t>(loop) * kNumLayers + static_cast<std::size_t>(layer);
+      ConvStep(s.q.data(), s.q_conv_state.data() + slot * kQConvSize, l.q_conv.data(),
+               kKeyDim);
+      ConvStep(s.k.data(), s.k_conv_state.data() + slot * kKConvSize, l.k_conv.data(),
+               kKeyDim);
+      ConvStep(s.v.data(), s.v_conv_state.data() + slot * kVConvSize, l.v_conv.data(),
+               kValueDim);
 
-    for (int h = 0; h < kNumHeads; ++h) {
-      float* qh = s.q.data() + h * kHeadKDim;
-      float* kh = s.k.data() + h * kHeadKDim;
-      L2Norm(qh, kHeadKDim);
-      L2Norm(kh, kHeadKDim);
-      for (int i = 0; i < kHeadKDim; ++i) qh[i] *= q_scale;
-      s.beta[h] = Sigmoid(DotScalar(s.xb.data(), l.b_proj.data() + h * kDim, kDim));
-      s.decay[h] =
-          std::exp(l.A[h] * Softplus(DotScalar(s.xb.data(),
-                                                l.a_proj.data() + h * kDim, kDim) +
-                                     l.dt_bias[h]));
-    }
-
-    float* S_layer =
-        s.S.data() + static_cast<std::size_t>(layer) * kNumHeads * kHeadKDim *
-                         kHeadVDim;
-    for (int h = 0; h < kNumHeads; ++h) {
-      float* S = S_layer + static_cast<std::size_t>(h) * kHeadKDim * kHeadVDim;
-      const float* qh = s.q.data() + h * kHeadKDim;
-      const float* kh = s.k.data() + h * kHeadKDim;
-      const float* vh = s.v.data() + h * kHeadVDim;
-      float* out = s.linear_out.data() + h * kHeadVDim;
-
-      for (int i = 0; i < kHeadKDim * kHeadVDim; ++i) S[i] *= s.decay[h];
-      for (int j = 0; j < kHeadVDim; ++j) {
-        float prediction = 0.0f;
-        for (int i = 0; i < kHeadKDim; ++i) prediction += S[i * kHeadVDim + j] * kh[i];
-        s.xb[j] = (vh[j] - prediction) * s.beta[h];
+      for (int h = 0; h < kNumHeads; ++h) {
+        float* qh = s.q.data() + h * kHeadKDim;
+        float* kh = s.k.data() + h * kHeadKDim;
+        L2Norm(qh, kHeadKDim);
+        L2Norm(kh, kHeadKDim);
+        for (int i = 0; i < kHeadKDim; ++i) qh[i] *= q_scale;
+        s.beta[h] = Sigmoid(DotScalar(s.xb.data(), l.b_proj.data() + h * kDim, kDim));
+        s.decay[h] =
+            std::exp(l.A[h] * Softplus(DotScalar(s.xb.data(),
+                                                  l.a_proj.data() + h * kDim, kDim) +
+                                       l.dt_bias[h]));
       }
-      for (int i = 0; i < kHeadKDim; ++i) {
-        for (int j = 0; j < kHeadVDim; ++j) S[i * kHeadVDim + j] += kh[i] * s.xb[j];
-      }
-      for (int j = 0; j < kHeadVDim; ++j) {
-        float value = 0.0f;
-        for (int i = 0; i < kHeadKDim; ++i) value += qh[i] * S[i * kHeadVDim + j];
-        out[j] = value;
-      }
-    }
 
-    for (int h = 0; h < kNumHeads; ++h) {
-      float* xh = s.linear_out.data() + h * kHeadVDim;
-      const float* gh = s.gate.data() + h * kHeadVDim;
-      float ss = 0.0f;
-      for (int i = 0; i < kHeadVDim; ++i) ss += xh[i] * xh[i];
-      ss = 1.0f / std::sqrt(ss / kHeadVDim + 1e-5f);
-      for (int i = 0; i < kHeadVDim; ++i)
-        xh[i] = l.o_norm[i] * (ss * xh[i]) * Silu(gh[i]);
+      float* S_layer = s.S.data() + slot * kNumHeads * kHeadKDim * kHeadVDim;
+      for (int h = 0; h < kNumHeads; ++h) {
+        float* S = S_layer + static_cast<std::size_t>(h) * kHeadKDim * kHeadVDim;
+        const float* qh = s.q.data() + h * kHeadKDim;
+        const float* kh = s.k.data() + h * kHeadKDim;
+        const float* vh = s.v.data() + h * kHeadVDim;
+        float* out = s.linear_out.data() + h * kHeadVDim;
+
+        for (int i = 0; i < kHeadKDim * kHeadVDim; ++i) S[i] *= s.decay[h];
+        for (int j = 0; j < kHeadVDim; ++j) {
+          float prediction = 0.0f;
+          for (int i = 0; i < kHeadKDim; ++i)
+            prediction += S[i * kHeadVDim + j] * kh[i];
+          s.xb[j] = (vh[j] - prediction) * s.beta[h];
+        }
+        for (int i = 0; i < kHeadKDim; ++i) {
+          for (int j = 0; j < kHeadVDim; ++j) S[i * kHeadVDim + j] += kh[i] * s.xb[j];
+        }
+        for (int j = 0; j < kHeadVDim; ++j) {
+          float value = 0.0f;
+          for (int i = 0; i < kHeadKDim; ++i) value += qh[i] * S[i * kHeadVDim + j];
+          out[j] = value;
+        }
+      }
+
+      for (int h = 0; h < kNumHeads; ++h) {
+        float* xh = s.linear_out.data() + h * kHeadVDim;
+        const float* gh = s.gate.data() + h * kHeadVDim;
+        float ss = 0.0f;
+        for (int i = 0; i < kHeadVDim; ++i) ss += xh[i] * xh[i];
+        ss = 1.0f / std::sqrt(ss / kHeadVDim + 1e-5f);
+        for (int i = 0; i < kHeadVDim; ++i)
+          xh[i] = l.o_norm[i] * (ss * xh[i]) * Silu(gh[i]);
+      }
+      Quantize(s.xq_q.data(), s.xq_s.data(), s.linear_out.data(), kValueDim);
+      Matmul(s.xb.data(), s.xq_q.data(), s.xq_s.data(), l.o_proj);
+      for (int i = 0; i < kDim; ++i) s.x[i] += s.xb[i];
     }
-    Quantize(s.xq_q.data(), s.xq_s.data(), s.linear_out.data(), kValueDim);
-    Matmul(s.xb.data(), s.xq_q.data(), s.xq_s.data(), l.o_proj);
-    for (int i = 0; i < kDim; ++i) s.x[i] += s.xb[i];
 
     // FFN.
     RmsNorm(s.xb.data(), s.x.data(), l.ffn_norm.data(), kDim);
@@ -1548,12 +1812,15 @@ int ArgmaxLogits(const float* logits, int count) {
 #if !defined(USE_CPU_ONLY)
 namespace gdn {
 
-int Decode(int token, bool reset_state, cl::CommandQueue& q, cl::Kernel& kernel,
-           std::uint32_t* next_token, cl::Buffer& next_token_buffer) {
+int Decode(int token, bool reset_state, int loop_count, cl::CommandQueue& q,
+           cl::Kernel& kernel, std::uint32_t* next_token,
+           cl::Buffer& next_token_buffer) {
   cl_int err = CL_SUCCESS;
   err = kernel.setArg(0, token);
   if (err != CL_SUCCESS) return -1;
   err = kernel.setArg(1, reset_state ? 1 : 0);
+  if (err != CL_SUCCESS) return -1;
+  err = kernel.setArg(2, loop_count);
   if (err != CL_SUCCESS) return -1;
   err = q.enqueueTask(kernel);
   if (err != CL_SUCCESS) return -1;

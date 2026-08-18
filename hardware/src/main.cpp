@@ -286,9 +286,9 @@ int main(int argc, char** argv) {
                            sizeof(std::uint32_t), next_aligned.data(), &err);
     OCL_THROW_IF_ERROR(err, "buffer_next");
 
-    OCL_CHECK(err, err = kernel.setArg(2, buffer_params));
-    OCL_CHECK(err, err = kernel.setArg(3, buffer_side));
-    OCL_CHECK(err, err = kernel.setArg(4, buffer_next));
+    OCL_CHECK(err, err = kernel.setArg(3, buffer_params));
+    OCL_CHECK(err, err = kernel.setArg(4, buffer_side));
+    OCL_CHECK(err, err = kernel.setArg(5, buffer_next));
     OCL_CHECK(err, err = queue.enqueueMigrateMemObjects(
                        {buffer_params, buffer_side}, 0));
     OCL_CHECK(err, err = queue.finish());
@@ -302,7 +302,7 @@ int main(int argc, char** argv) {
 #ifdef USE_CPU_ONLY
       gdn::CpuForward(state, weights, token, logits.data());
 #else
-      const int fpga_next = gdn::Decode(token, pos == 0, queue, kernel,
+      const int fpga_next = gdn::Decode(token, pos == 0, 1, queue, kernel,
                                         next_aligned.data(), buffer_next);
       if (fpga_next < 0) {
         throw std::runtime_error("decode kernel failed");

@@ -12,11 +12,12 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
 
-extern "C" void decode(int token, int reset_state,
+extern "C" void decode(int token, int reset_state, int loop_count,
                        const ap_uint<128>* packed_params, const float* side,
                        std::uint32_t* next_token);
 
@@ -40,6 +41,13 @@ int main(int argc, char** argv) {
   const std::string weight_path =
       argc > 1 ? argv[1] : "model/climbmix15M_demo_q8.bin";
   const int steps = argc > 2 ? std::atoi(argv[2]) : 8;
+  int loop_count = argc > 3 ? std::atoi(argv[3]) : 1;
+  if (loop_count < 1) {
+    loop_count = 1;
+  }
+  if (loop_count > gdn::kMaxLoopCount) {
+    loop_count = gdn::kMaxLoopCount;
+  }
 
   gdn::Weights weights;
   gdn::LoadWeights(weights, weight_path);
@@ -65,9 +73,10 @@ int main(int argc, char** argv) {
   for (int step = 0; step < steps; ++step) {
     const int token = drive[step % drive_count];
     std::uint32_t fpga_next = 0;
-    decode(token, step == 0 ? 1 : 0, params.data(), side.data(), &fpga_next);
+    decode(token, step == 0 ? 1 : 0, loop_count, params.data(), side.data(),
+           &fpga_next);
 
-    gdn::CpuForward(state, weights, token, logits.data());
+    gdn::CpuForward(state, weights, token, logits.data(), loop_count);
     const int cpu_next = gdn::ArgmaxLogits(logits.data(), gdn::kVocabSize);
 
     const bool ok = static_cast<int>(fpga_next) == cpu_next;

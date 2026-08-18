@@ -16,6 +16,7 @@ constexpr int kHeadVDim = 32;
 constexpr int kConvSize = 4;
 constexpr int kVocabSize = 32000;
 constexpr int kSeqLen = 1024;
+constexpr int kMaxLoopCount = 4;
 constexpr int kKeyDim = kNumHeads * kHeadKDim;
 constexpr int kValueDim = kNumHeads * kHeadVDim;
 
@@ -115,13 +116,14 @@ constexpr int SideONormOffset(int layer) {
 }
 constexpr int kSideFloatCount = SideLayerBase(kNumLayers);
 
-constexpr std::size_t kSStateCount = static_cast<std::size_t>(kNumLayers) *
-                                     kNumHeads * kHeadKDim * kHeadVDim;
+constexpr std::size_t kSStateCount = static_cast<std::size_t>(kMaxLoopCount) *
+                                     kNumLayers * kNumHeads * kHeadKDim *
+                                     kHeadVDim;
 constexpr std::size_t kQConvStateCount =
-    static_cast<std::size_t>(kNumLayers) * kKeyDim * kConvSize;
+    static_cast<std::size_t>(kMaxLoopCount) * kNumLayers * kKeyDim * kConvSize;
 constexpr std::size_t kKConvStateCount = kQConvStateCount;
 constexpr std::size_t kVConvStateCount =
-    static_cast<std::size_t>(kNumLayers) * kValueDim * kConvSize;
+    static_cast<std::size_t>(kMaxLoopCount) * kNumLayers * kValueDim * kConvSize;
 constexpr int kStateBanks = 16;
 constexpr int kStateGroups = kHeadVDim / kStateBanks;
 

@@ -23,7 +23,7 @@ struct RunState {
 };
 
 void CpuForward(RunState& state, const Weights& weights, int token,
-                float* logits);
+                float* logits, int loop_count = 1);
 int ArgmaxLogits(const float* logits, int count);
 
 } // namespace gdn
@@ -41,7 +41,7 @@ int ArgmaxLogits(const float* logits, int count);
 #if !defined(USE_CPU_ONLY) && !defined(BUILD_DECODE_KERNEL)
 namespace gdn {
 
-int Decode(int token, bool reset_state, cl::CommandQueue& q,
+int Decode(int token, bool reset_state, int loop_count, cl::CommandQueue& q,
            cl::Kernel& kernel, std::uint32_t* next_token,
            cl::Buffer& next_token_buffer);
 
