@@ -39,8 +39,9 @@ This repository fixes one software/hardware anchor before exploring ablations:
 | deployment arithmetic | W8A8, group size 32 |
 | checkpoint format | GDNe v2 |
 
-The HF config records the training loop count. The Q8 format does not: T=1 and
-T=4 use the same tensor order and weight layout.
+The HF config records the training loop count. The GDNe v2 header pad (file
+offset 48) stores the same T so the FPGA host can select T=1 or T=4 from one
+bitstream. Tensor bytes after the 256-byte header stay identical.
 
 ## Environment
 
@@ -103,11 +104,12 @@ LOOP_COUNT=4 STEPS=100000 SEQ_LEN=256 NGPU=2 \
   bash train.sh
 ```
 
-## Hardware baseline
+## Hardware
 
-`hardware/` is the verified T=1 single-kernel GDN accelerator imported from
-`gdn.hls`. It is intentionally retained as the clean hardware milestone; T=4
-scheduling and memory/computation overlap are the next hardware phase.
+`hardware/` is the MixerLoop KV260 accelerator: one production bitstream, runtime
+`loop_count` selects T=1 or T=4. T=4 replays Mixer weights from SRAM and
+prefetches FFN into an on-chip ring. On KV260 at 150 MHz, T=1 is 116.4 token/s
+and T=4 is 88.4 token/s; both match the CPU Q8 oracle.
 
 The canonical comparison weights are stored as:
 

@@ -32,5 +32,5 @@ COMMON_FLAGS=(-Wall -Wextra -Wno-unknown-pragmas -O2 -std=c++20 -pthread
 echo "built: $OUT/kernel_sim"
 
 if [[ $# -gt 0 ]]; then
-  "$OUT/kernel_sim" "$1" "${2:-8}" "${3:-1}"
+  "$OUT/kernel_sim" "$@"
 fi

@@ -11,15 +11,24 @@ APP=${APP:-gdn}
 ssh "$KV260" "rm -rf $REMOTE && mkdir -p $REMOTE/model"
 scp "$BUNDLE/gdn_host" "$BUNDLE/binary_container_1.bin" \
     "$BUNDLE/pl.dtbo" "$BUNDLE/shell.json" "$KV260:$REMOTE/"
-scp "$BUNDLE/model/model.q8.bin" "$BUNDLE/model/tokenizer.bin" \
-    "$KV260:$REMOTE/model/"
+scp "$BUNDLE"/model/* "$KV260:$REMOTE/model/"
 
-# The board account must provide passwordless sudo (or already be root).
-ssh "$KV260" "sudo mkdir -p /lib/firmware/xilinx/$APP && \
-  sudo cp $REMOTE/binary_container_1.bin $REMOTE/pl.dtbo $REMOTE/shell.json \
+# The board account may require a sudo password. Set SUDO_PASSWORD rather than
+# storing it in the repository. Empty means passwordless sudo.
+SUDO_PASSWORD=${SUDO_PASSWORD:-}
+remote_sudo() {
+  if [[ -n "$SUDO_PASSWORD" ]]; then
+    ssh "$KV260" "echo '$SUDO_PASSWORD' | sudo -S -p '' bash -lc $(printf '%q' "$*")"
+  else
+    ssh "$KV260" "sudo bash -lc $(printf '%q' "$*")"
+  fi
+}
+
+remote_sudo "mkdir -p /lib/firmware/xilinx/$APP && \
+  cp $REMOTE/binary_container_1.bin $REMOTE/pl.dtbo $REMOTE/shell.json \
      /lib/firmware/xilinx/$APP/ && \
-  sudo xmutil unloadapp >/dev/null 2>&1; \
-  sudo xmutil loadapp $APP"
+  xmutil unloadapp >/dev/null 2>&1 || true; \
+  xmutil loadapp $APP"
 
 echo "deployed to $KV260:$REMOTE (app=$APP)"
 
@@ -28,7 +37,6 @@ echo "deployed to $KV260:$REMOTE (app=$APP)"
 # to leave the gdn bitstream loaded.
 RESTORE_STARTER=${RESTORE_STARTER:-1}
 if [[ "$RESTORE_STARTER" == "1" ]]; then
-  ssh "$KV260" "sudo xmutil unloadapp >/dev/null 2>&1; \
-    sudo xmutil loadapp k26-starter-kits"
+  remote_sudo "xmutil unloadapp >/dev/null 2>&1 || true; xmutil loadapp k26-starter-kits"
   echo "restored k26-starter-kits on $KV260 (fan quiet)"
 fi

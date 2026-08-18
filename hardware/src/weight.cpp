@@ -138,6 +138,10 @@ void LoadWeights(Weights& w, const std::string& path) {
   if (h.seq_len < 1 || h.seq_len > kSeqLen) {
     throw std::runtime_error("checkpoint seq_len exceeds the hardware profile");
   }
+  if (h.pad != 0 && (h.pad < 1 || h.pad > kMaxLoopCount)) {
+    throw std::runtime_error("checkpoint loop_count (header pad) is out of range");
+  }
+  w.loop_count = h.pad;
 
   fs.seekg(kCheckpointHeaderBytes, std::ios::beg);
 

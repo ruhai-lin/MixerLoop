@@ -43,10 +43,19 @@ constexpr int kMixerCacheBase = 0;
 // Frozen Mixer Q8 cache: scratch[0, 5759], 8×64-bit banks, 24 URAM.
 // loop0 writes all 5760 words; loop1–3 read 512 bit/cycle from the same window.
 constexpr int kMixerCacheWords = kPackedQKVGWords + kPackedProjWords;
+constexpr int kFfnRingBase = kMixerCacheWords;
+constexpr int kFfnRingWords = 6528;
+constexpr int kFfnPackedWords = 2 * kPackedW13Words + kPackedW2Words;
+constexpr int kFfnPrefetchChunk = kFfnRingWords / 3;
+constexpr int kFfnTailWords = kFfnPackedWords - kFfnRingWords;
 constexpr int kQkvgRows = 2 * (kHeadKDim + kHeadVDim);
 static_assert(kMixerCacheWords == 5760, "Mixer cache must be 5760 packed words");
 static_assert(kScratchBanks == 8, "Mixer scratch is 8×64-bit");
 static_assert(kMixerCacheBase == 0, "Mixer cache occupies scratch[0, 5759]");
+static_assert(kFfnRingBase + kFfnRingWords == kScratchDepth,
+              "FFN ring must occupy scratch[5760, 12287]");
+static_assert(kFfnPrefetchChunk * 3 == kFfnRingWords, "three prefetch chunks fill the ring");
+static_assert(kFfnTailWords == 3840, "FFN tail after a full ring is 3840 words");
 
 using ParameterBeat = ap_uint<128>;
 using ParameterWord = ap_uint<512>;
@@ -91,10 +100,15 @@ enum MemKind {
   kMemFill,
   kMemW13,
   kMemW2,
+  kMemFfnPrefetch,
   kMemLm,
   kMemStore
 };
-enum ScratchKind { kScratchFill = 0, kScratchRead };
+enum ScratchKind {
+  kScratchFill = 0,
+  kScratchRead,
+  kScratchRingRead
+};
 enum Q8Kind { kQ8Qkvg = 0, kQ8O, kQ8W13, kQ8W2, kQ8Lm };
 enum PostKind {
   kPostEmbed = 0,
@@ -120,12 +134,15 @@ struct MemCmd {
   CmdHeader hdr;
   unsigned char kind;
   int token;
+  int offset;
+  int count;
 };
 struct ScratchCmd {
   CmdHeader hdr;
   unsigned char kind;
   int addr;
   int count;
+  int fill_count;
 };
 struct RouteCmd {
   CmdHeader hdr;
@@ -822,12 +839,15 @@ static void write_end(hls::stream<MemCmd>& mem_cmds,
   mem.hdr = end;
   mem.kind = 0;
   mem.token = 0;
+  mem.offset = 0;
+  mem.count = 0;
   mem_cmds.write(mem);
   ScratchCmd sc;
   sc.hdr = end;
   sc.kind = 0;
   sc.addr = 0;
   sc.count = 0;
+  sc.fill_count = 0;
   scratch_cmds.write(sc);
   RouteCmd rt;
   rt.hdr = end;
@@ -860,10 +880,13 @@ static void controller(int token, int reset_state, int loop_count,
                        hls::stream<int>& conv_reset, hls::stream<int>& rec_reset) {
 #pragma HLS INLINE off
   const int loops = clamp_loop_count(loop_count);
+  const bool overlap = loops == kMaxLoopCount;
   conv_reset.write(reset_state);
   rec_reset.write(reset_state);
 
   MemCmd mem;
+  mem.offset = 0;
+  mem.count = 0;
   mem.hdr = make_hdr(kPhaseBegin, 0, 0, kWeightNone, kSrcAxi, kDstNone);
   mem.kind = kMemEmbed;
   mem.token = token;
@@ -885,10 +908,14 @@ static void controller(int token, int reset_state, int loop_count,
 
       mem.hdr = make_hdr(kPhaseLayer, layer_id, loop, kWeightNone, kSrcAxi, kDstNone);
       mem.kind = kMemSide;
+      mem.token = 0;
+      mem.offset = 0;
+      mem.count = 0;
       mem_cmds.write(mem);
 
       ScratchCmd sc;
       sc.hdr = make_hdr(kPhaseLayer, layer_id, loop, kWeightMixerQkvg, src, mix_dst);
+      sc.fill_count = 0;
       if (loop_i == 0) {
         mem.hdr = sc.hdr;
         mem.kind = kMemFill;
@@ -898,9 +925,18 @@ static void controller(int token, int reset_state, int loop_count,
         sc.count = kMixerCacheWords;
         scratch_cmds.write(sc);
       } else {
+        if (overlap) {
+          mem.hdr = make_hdr(kPhaseLayer, layer_id, loop, kWeightW13, kSrcAxi,
+                             kDstScratch);
+          mem.kind = kMemFfnPrefetch;
+          mem.offset = (loop_i - 1) * kFfnPrefetchChunk;
+          mem.count = kFfnPrefetchChunk;
+          mem_cmds.write(mem);
+        }
         sc.kind = kScratchRead;
         sc.addr = kMixerCacheBase;
         sc.count = kPackedQKVGWords;
+        sc.fill_count = overlap ? kFfnPrefetchChunk : 0;
         scratch_cmds.write(sc);
       }
 
@@ -931,6 +967,7 @@ static void controller(int token, int reset_state, int loop_count,
         sc.kind = kScratchRead;
         sc.addr = kPackedQKVGWords;
         sc.count = kPackedProjWords;
+        sc.fill_count = 0;
         scratch_cmds.write(sc);
       }
       rt.hdr = make_hdr(kPhaseLayer, layer_id, loop, kWeightMixerO, src, kDstQ8);
@@ -945,39 +982,88 @@ static void controller(int token, int reset_state, int loop_count,
       post_cmds.write(post);
     }
 
-    mem.hdr = make_hdr(kPhaseLayer, layer_id, 0, kWeightW13, kSrcAxi, kDstQ8);
-    mem.kind = kMemW13;
-    mem_cmds.write(mem);
     RouteCmd rt;
-    rt.hdr = mem.hdr;
-    rt.count = 2 * kPackedW13Words;
-    route_cmds.write(rt);
     Q8Cmd q8;
-    q8.hdr = mem.hdr;
-    q8.kind = kQ8W13;
-    q8.rows = kHiddenDim;
-    q8.groups = kDimGroups;
-    q8_cmds.write(q8);
-    post.hdr = mem.hdr;
-    post.kind = kPostFfn;
-    post_cmds.write(post);
-    post.kind = kPostW13;
-    post_cmds.write(post);
+    if (overlap) {
+      mem.hdr = make_hdr(kPhaseLayer, layer_id, 0, kWeightW13, kSrcAxi, kDstScratch);
+      mem.kind = kMemFfnPrefetch;
+      mem.offset = kFfnRingWords;
+      mem.count = kFfnTailWords;
+      mem_cmds.write(mem);
 
-    mem.hdr = make_hdr(kPhaseLayer, layer_id, 0, kWeightW2, kSrcAxi, kDstQ8);
-    mem.kind = kMemW2;
-    mem_cmds.write(mem);
-    rt.hdr = mem.hdr;
-    rt.count = kPackedW2Words;
-    route_cmds.write(rt);
-    q8.hdr = mem.hdr;
-    q8.kind = kQ8W2;
-    q8.rows = kDim;
-    q8.groups = kHiddenGroups;
-    q8_cmds.write(q8);
-    post.hdr = mem.hdr;
-    post.kind = kPostResW2;
-    post_cmds.write(post);
+      post.hdr = make_hdr(kPhaseLayer, layer_id, 0, kWeightW13, kSrcSram, kDstQ8);
+      post.kind = kPostFfn;
+      post_cmds.write(post);
+
+      ScratchCmd sc;
+      sc.hdr = post.hdr;
+      sc.kind = kScratchRingRead;
+      sc.addr = kFfnRingBase;
+      sc.count = 2 * kPackedW13Words;
+      sc.fill_count = 0;
+      scratch_cmds.write(sc);
+      rt.hdr = sc.hdr;
+      rt.count = 2 * kPackedW13Words;
+      route_cmds.write(rt);
+      q8.hdr = sc.hdr;
+      q8.kind = kQ8W13;
+      q8.rows = kHiddenDim;
+      q8.groups = kDimGroups;
+      q8_cmds.write(q8);
+      post.kind = kPostW13;
+      post_cmds.write(post);
+
+      sc.hdr = make_hdr(kPhaseLayer, layer_id, 0, kWeightW2, kSrcSram, kDstQ8);
+      sc.kind = kScratchRingRead;
+      sc.count = kPackedW2Words;
+      sc.fill_count = 0;
+      scratch_cmds.write(sc);
+      rt.hdr = sc.hdr;
+      rt.count = kPackedW2Words;
+      route_cmds.write(rt);
+      q8.hdr = sc.hdr;
+      q8.kind = kQ8W2;
+      q8.rows = kDim;
+      q8.groups = kHiddenGroups;
+      q8_cmds.write(q8);
+      post.hdr = sc.hdr;
+      post.kind = kPostResW2;
+      post_cmds.write(post);
+    } else {
+      mem.hdr = make_hdr(kPhaseLayer, layer_id, 0, kWeightW13, kSrcAxi, kDstQ8);
+      mem.kind = kMemW13;
+      mem.offset = 0;
+      mem.count = 0;
+      mem_cmds.write(mem);
+      rt.hdr = mem.hdr;
+      rt.count = 2 * kPackedW13Words;
+      route_cmds.write(rt);
+      q8.hdr = mem.hdr;
+      q8.kind = kQ8W13;
+      q8.rows = kHiddenDim;
+      q8.groups = kDimGroups;
+      q8_cmds.write(q8);
+      post.hdr = mem.hdr;
+      post.kind = kPostFfn;
+      post_cmds.write(post);
+      post.kind = kPostW13;
+      post_cmds.write(post);
+
+      mem.hdr = make_hdr(kPhaseLayer, layer_id, 0, kWeightW2, kSrcAxi, kDstQ8);
+      mem.kind = kMemW2;
+      mem_cmds.write(mem);
+      rt.hdr = mem.hdr;
+      rt.count = kPackedW2Words;
+      route_cmds.write(rt);
+      q8.hdr = mem.hdr;
+      q8.kind = kQ8W2;
+      q8.rows = kDim;
+      q8.groups = kHiddenGroups;
+      q8_cmds.write(q8);
+      post.hdr = mem.hdr;
+      post.kind = kPostResW2;
+      post_cmds.write(post);
+    }
   }
 
   mem.hdr = make_hdr(kPhaseLm, 0, 0, kWeightLm, kSrcAxi, kDstQ8);
@@ -1049,19 +1135,21 @@ static void load_embedding(hls::stream<float>& out, const ParameterBeat* params,
 }
 
 static void memory_process(const ParameterBeat* params, const float* side,
-                           uint32_t* next_token, hls::stream<MemCmd>& cmds,
-                           hls::stream<float>& embed, hls::stream<float>& rms_final,
-                           hls::stream<float>& rms_att, hls::stream<float>& rms_ffn,
-                           hls::stream<float>& beta_side, hls::stream<float>& conv_w,
-                           hls::stream<float>& o_norm,
+                           uint32_t* next_token, uint32_t* stats,
+                           hls::stream<MemCmd>& cmds, hls::stream<float>& embed,
+                           hls::stream<float>& rms_final, hls::stream<float>& rms_att,
+                           hls::stream<float>& rms_ffn, hls::stream<float>& beta_side,
+                           hls::stream<float>& conv_w, hls::stream<float>& o_norm,
                            hls::stream<ParameterWord>& fill_words,
                            hls::stream<ParameterWord>& axi_out,
-                           hls::stream<uint32_t>& lm_token) {
+                           hls::stream<uint32_t>& lm_token,
+                           hls::stream<uint32_t>& occupancy) {
 #pragma HLS INLINE off
   for (;;) {
 #pragma HLS LOOP_TRIPCOUNT min = 36 max = 36
     const MemCmd cmd = cmds.read();
     if (cmd.hdr.phase == kPhaseEnd) {
+      stats[0] = occupancy.read();
       break;
     }
     const int layer = cmd.hdr.layer_id;
@@ -1087,6 +1175,8 @@ static void memory_process(const ParameterBeat* params, const float* side,
       axi_words(axi_out, params, PackedW13Offset(layer), 2 * kPackedW13Words);
     } else if (cmd.kind == kMemW2) {
       axi_words(axi_out, params, PackedW2Offset(layer), kPackedW2Words);
+    } else if (cmd.kind == kMemFfnPrefetch) {
+      axi_words(fill_words, params, PackedW13Offset(layer) + cmd.offset, cmd.count);
     } else if (cmd.kind == kMemLm) {
       axi_words(axi_out, params, kPackedTokOffset, kPackedTokWords);
     } else {
@@ -1095,18 +1185,31 @@ static void memory_process(const ParameterBeat* params, const float* side,
   }
 }
 
+static int ring_next(int ptr) {
+#pragma HLS INLINE
+  const int next = ptr + 1;
+  return next >= kFfnRingWords ? 0 : next;
+}
+
 static void scratch_process(hls::stream<ScratchCmd>& cmds,
                             hls::stream<ParameterWord>& fill_words,
-                            hls::stream<ParameterWord>& sram_words) {
+                            hls::stream<ParameterWord>& sram_words,
+                            hls::stream<uint32_t>& occupancy_out) {
 #pragma HLS INLINE off
   static ScratchMem scratch;
 #pragma HLS BIND_STORAGE variable = scratch type = ram_s2p impl = uram
 #pragma HLS ARRAY_PARTITION variable = scratch complete dim = 1
 
+  int wr_ptr = 0;
+  int rd_ptr = 0;
+  int occupancy = 0;
+  int max_occupancy = 0;
+
   for (;;) {
-#pragma HLS LOOP_TRIPCOUNT min = 25 max = 25
+#pragma HLS LOOP_TRIPCOUNT min = 25 max = 80
     const ScratchCmd cmd = cmds.read();
     if (cmd.hdr.phase == kPhaseEnd) {
+      occupancy_out.write(static_cast<uint32_t>(max_occupancy));
       break;
     }
     if (cmd.kind == kScratchFill) {
@@ -1114,10 +1217,37 @@ static void scratch_process(hls::stream<ScratchCmd>& cmds,
 #pragma HLS PIPELINE II = 1
         scratch_write(scratch, cmd.addr + it, fill_words.read());
       }
+    } else if (cmd.kind == kScratchRead) {
+      if (cmd.fill_count > 0 && cmd.hdr.loop_id == 1) {
+        wr_ptr = 0;
+        rd_ptr = 0;
+        occupancy = 0;
+      }
+      const int n = cmd.count > cmd.fill_count ? cmd.count : cmd.fill_count;
+      for (int it = 0; it < n; ++it) {
+#pragma HLS PIPELINE II = 1
+        if (it < cmd.count) {
+          sram_words.write(scratch_read(scratch, cmd.addr + it));
+        }
+        if (it < cmd.fill_count) {
+          scratch_write(scratch, kFfnRingBase + wr_ptr, fill_words.read());
+          wr_ptr = ring_next(wr_ptr);
+          occupancy++;
+          if (occupancy > max_occupancy) {
+            max_occupancy = occupancy;
+          }
+        }
+      }
     } else {
       for (int it = 0; it < cmd.count; ++it) {
 #pragma HLS PIPELINE II = 1
-        sram_words.write(scratch_read(scratch, cmd.addr + it));
+        if (occupancy == 0) {
+          sram_words.write(fill_words.read());
+        } else {
+          sram_words.write(scratch_read(scratch, kFfnRingBase + rd_ptr));
+          rd_ptr = ring_next(rd_ptr);
+          occupancy--;
+        }
       }
     }
   }
@@ -1424,12 +1554,14 @@ extern "C" {
 
 void decode(int token, int reset_state, int loop_count,
             const ParameterBeat* __restrict packed_params, const float* side,
-            uint32_t* next_token) {
+            uint32_t* next_token, uint32_t* stats) {
 #pragma HLS INTERFACE m_axi port = packed_params bundle = params0 \
     max_read_burst_length = 256 num_read_outstanding = 16
 #pragma HLS INTERFACE m_axi port = side bundle = gmem \
     max_read_burst_length = 64 num_read_outstanding = 4
 #pragma HLS INTERFACE m_axi port = next_token bundle = gmem \
+    num_write_outstanding = 2
+#pragma HLS INTERFACE m_axi port = stats bundle = gmem \
     num_write_outstanding = 2
 #pragma HLS INTERFACE s_axilite port = token bundle = control
 #pragma HLS INTERFACE s_axilite port = reset_state bundle = control
@@ -1437,6 +1569,7 @@ void decode(int token, int reset_state, int loop_count,
 #pragma HLS INTERFACE s_axilite port = packed_params bundle = control
 #pragma HLS INTERFACE s_axilite port = side bundle = control
 #pragma HLS INTERFACE s_axilite port = next_token bundle = control
+#pragma HLS INTERFACE s_axilite port = stats bundle = control
 #pragma HLS INTERFACE s_axilite port = return bundle = control
 
   hls::stream<MemCmd> mem_cmds("mem_cmds");
@@ -1471,6 +1604,7 @@ void decode(int token, int reset_state, int loop_count,
   hls::stream<float> w13_vec("w13_vec");
   hls::stream<float> w2_vec("w2_vec");
   hls::stream<uint32_t> lm_token("lm_token");
+  hls::stream<uint32_t> occupancy("occupancy");
 #ifdef __SYNTHESIS__
 #pragma HLS STREAM variable = mem_cmds depth = 16
 #pragma HLS STREAM variable = scratch_cmds depth = 16
@@ -1526,6 +1660,8 @@ void decode(int token, int reset_state, int loop_count,
 #pragma HLS STREAM variable = w13_vec depth = 256
 #pragma HLS STREAM variable = w2_vec depth = 256
 #pragma HLS STREAM variable = lm_token depth = 2
+#pragma HLS STREAM variable = occupancy depth = 2
+#pragma HLS BIND_STORAGE variable = occupancy type = fifo impl = srl
 
 #ifdef __SYNTHESIS__
   // One call site per frozen process. Synthesis builds parallel RTL;
@@ -1534,10 +1670,10 @@ void decode(int token, int reset_state, int loop_count,
   controller(token, reset_state, loop_count, mem_cmds, scratch_cmds, route_cmds,
              q8_cmds, beta_cmds, conv_cmds, rec_cmds, post_cmds, conv_reset,
              rec_reset);
-  memory_process(packed_params, side, next_token, mem_cmds, embed, rms_final,
+  memory_process(packed_params, side, next_token, stats, mem_cmds, embed, rms_final,
                  rms_att, rms_ffn, beta_side, conv_w, o_norm, fill_words,
-                 axi_words_s, lm_token);
-  scratch_process(scratch_cmds, fill_words, sram_words);
+                 axi_words_s, lm_token, occupancy);
+  scratch_process(scratch_cmds, fill_words, sram_words, occupancy);
   weight_router(route_cmds, axi_words_s, sram_words, weights);
   q8_process(q8_cmds, weights, acts, qkvg, o_vec, w13_vec, w2_vec, lm_token);
   beta_process(beta_cmds, beta_side, attn_norm, betas);
@@ -1552,12 +1688,12 @@ void decode(int token, int reset_state, int loop_count,
                rec_reset);
   });
   std::thread t_mem([&] {
-    memory_process(packed_params, side, next_token, mem_cmds, embed, rms_final,
+    memory_process(packed_params, side, next_token, stats, mem_cmds, embed, rms_final,
                    rms_att, rms_ffn, beta_side, conv_w, o_norm, fill_words,
-                   axi_words_s, lm_token);
+                   axi_words_s, lm_token, occupancy);
   });
   std::thread t_scratch(
-      [&] { scratch_process(scratch_cmds, fill_words, sram_words); });
+      [&] { scratch_process(scratch_cmds, fill_words, sram_words, occupancy); });
   std::thread t_router(
       [&] { weight_router(route_cmds, axi_words_s, sram_words, weights); });
   std::thread t_q8([&] {
@@ -1814,7 +1950,7 @@ namespace gdn {
 
 int Decode(int token, bool reset_state, int loop_count, cl::CommandQueue& q,
            cl::Kernel& kernel, std::uint32_t* next_token,
-           cl::Buffer& next_token_buffer) {
+           cl::Buffer& next_token_buffer, cl::Buffer& stats_buffer) {
   cl_int err = CL_SUCCESS;
   err = kernel.setArg(0, token);
   if (err != CL_SUCCESS) return -1;
@@ -1824,7 +1960,7 @@ int Decode(int token, bool reset_state, int loop_count, cl::CommandQueue& q,
   if (err != CL_SUCCESS) return -1;
   err = q.enqueueTask(kernel);
   if (err != CL_SUCCESS) return -1;
-  err = q.enqueueMigrateMemObjects({next_token_buffer},
+  err = q.enqueueMigrateMemObjects({next_token_buffer, stats_buffer},
                                    CL_MIGRATE_MEM_OBJECT_HOST);
   if (err != CL_SUCCESS) return -1;
   err = q.finish();

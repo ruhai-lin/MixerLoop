@@ -28,6 +28,7 @@ v++ -l -t hw \
   --connectivity.sp decode_1.packed_params:HP0 \
   --connectivity.sp decode_1.side:HP0 \
   --connectivity.sp decode_1.next_token:HP0 \
+  --connectivity.sp decode_1.stats:HP0 \
   --save-temps \
   --temp_dir "$OUT/_x" \
   --log_dir "$PROJECT/outputs/logs/link" \

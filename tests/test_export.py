@@ -82,17 +82,20 @@ def test_q8_format_is_loop_independent(loop_count, tmp_path):
     assert header[0] == CHECKPOINT_MAGIC
     assert header[1] == CHECKPOINT_VERSION
     assert header[2:10] == (256, 768, 1, 8, 32, 32, 4, 32000)
-    assert header[10:14] == (256, 1, 0, 32)
+    assert header[10:14] == (256, 1, loop_count, 32)
     assert len(data) == expected_q8_size(config)
 
 
-def test_q8_bytes_do_not_encode_loop_count(tmp_path):
+def test_q8_tensor_bytes_are_loop_independent(tmp_path):
     config = deployment_config(1)
     model = AutoModelForCausalLM.from_config(config)
-    t1 = export_q8_checkpoint(model, tmp_path / "t1.bin")
+    t1 = export_q8_checkpoint(model, tmp_path / "t1.bin").read_bytes()
     model.config.loop_count = 4
-    t4 = export_q8_checkpoint(model, tmp_path / "t4.bin")
-    assert t1.read_bytes() == t4.read_bytes()
+    t4 = export_q8_checkpoint(model, tmp_path / "t4.bin").read_bytes()
+    assert t1[:48] == t4[:48]
+    assert t1[52:] == t4[52:]
+    assert struct.unpack_from("<i", t1, 48)[0] == 1
+    assert struct.unpack_from("<i", t4, 48)[0] == 4
 
 
 def test_tokenizer_binary_is_stable(tmp_path):

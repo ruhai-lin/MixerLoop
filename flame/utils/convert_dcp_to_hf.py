@@ -79,6 +79,9 @@ def export_q8_checkpoint(
     tied = bool(config.tie_word_embeddings)
     if not tied:
         raise ValueError("the hardware profile requires tied input and output embeddings")
+    loop_count = int(getattr(config, "loop_count", 1))
+    if not 1 <= loop_count <= 4:
+        raise ValueError(f"loop_count must be between 1 and 4, got {loop_count}")
 
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -97,7 +100,7 @@ def export_q8_checkpoint(
             int(config.vocab_size),
             int(config.max_position_embeddings),
             int(tied),
-            0,
+            loop_count,
             group_size,
         )
         handle.write(header)

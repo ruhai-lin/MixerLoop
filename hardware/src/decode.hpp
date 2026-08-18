@@ -43,7 +43,7 @@ namespace gdn {
 
 int Decode(int token, bool reset_state, int loop_count, cl::CommandQueue& q,
            cl::Kernel& kernel, std::uint32_t* next_token,
-           cl::Buffer& next_token_buffer);
+           cl::Buffer& next_token_buffer, cl::Buffer& stats_buffer);
 
 } // namespace gdn
 #endif // FPGA host build

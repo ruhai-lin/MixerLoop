@@ -129,11 +129,32 @@ struct Args {
   std::string xclbin_path = "./binary_container_1.bin";
   std::string prompt = "";
   int max_seq = 128;
+  int loop_count = 0;
   float temp = 0.0f;
   float topp = 0.9f;
   unsigned long long seed = 1337;
   bool help = false;
 };
+
+static int ResolveLoopCount(int cli, int header) {
+  if (cli != 0 && (cli < 1 || cli > gdn::kMaxLoopCount)) {
+    throw std::runtime_error("--loop_count must be between 1 and 4");
+  }
+  if (cli != 0 && header != 0 && cli != header) {
+    throw std::runtime_error("loop_count mismatch: --loop_count " +
+                             std::to_string(cli) + " vs header " +
+                             std::to_string(header));
+  }
+  if (cli != 0) {
+    return cli;
+  }
+  if (header != 0) {
+    return header;
+  }
+  throw std::runtime_error(
+      "loop_count unspecified: pass --loop_count or store T in the checkpoint "
+      "header pad");
+}
 
 static void ParseArgs(int argc, char** argv, Args& args) {
   for (int i = 1; i < argc; ++i) {
@@ -160,6 +181,8 @@ static void ParseArgs(int argc, char** argv, Args& args) {
       args.topp = std::stof(require_value(opt.c_str()));
     } else if (opt == "--seed" || opt == "-s") {
       args.seed = std::stoull(require_value(opt.c_str()));
+    } else if (opt == "--loop_count") {
+      args.loop_count = std::stoi(require_value("--loop_count"));
     } else if (opt == "--help" || opt == "-h") {
       args.help = true;
     } else {
@@ -178,7 +201,9 @@ static void PrintUsage(const char* exe) {
             << "  -n, --max_seq N      Decode steps, default 128\n"
             << "  -t, --temp FLOAT     Temperature, 0 means argmax\n"
             << "  -p, --topp FLOAT     Top-p threshold, default 0.9\n"
-            << "  -s, --seed INT       RNG seed\n";
+            << "  -s, --seed INT       RNG seed\n"
+            << "  --loop_count N       Mixer loops, 1 or 4; default is the "
+               "checkpoint header\n";
 }
 
 int main(int argc, char** argv) {
@@ -190,6 +215,10 @@ int main(int argc, char** argv) {
       return 0;
     }
 
+    gdn::Weights weights;
+    gdn::LoadWeights(weights, args.weight_path);
+    const int loop_count = ResolveLoopCount(args.loop_count, weights.loop_count);
+
     std::cout << "GDN 15M constants\n"
               << "  dim       : " << gdn::kDim << "\n"
               << "  hidden_dim: " << gdn::kHiddenDim << "\n"
@@ -197,10 +226,8 @@ int main(int argc, char** argv) {
               << "  n_heads   : " << gdn::kNumHeads << "\n"
               << "  head dims : " << gdn::kHeadKDim << "/" << gdn::kHeadVDim << "\n"
               << "  vocab_size: " << gdn::kVocabSize << "\n"
-              << "  seq_len   : " << gdn::kSeqLen << std::endl;
-
-    gdn::Weights weights;
-    gdn::LoadWeights(weights, args.weight_path);
+              << "  seq_len   : " << gdn::kSeqLen << "\n"
+              << "  loop_count: " << loop_count << std::endl;
     gdn::Tokenizer tokenizer =
         gdn::LoadTokenizer(args.vocab_path, gdn::kVocabSize);
     std::vector<int> prompt_tokens =
@@ -228,6 +255,7 @@ int main(int argc, char** argv) {
     AlignedVector<float> side(side_src.size());
     std::memcpy(side.data(), side_src.data(), side_src.size() * sizeof(float));
     AlignedVector<std::uint32_t> next_aligned(1, 0);
+    AlignedVector<std::uint32_t> stats_aligned(8, 0);
 
     cl_int err = CL_SUCCESS;
     std::vector<cl::Platform> platforms;
@@ -285,10 +313,15 @@ int main(int argc, char** argv) {
     cl::Buffer buffer_next(context, CL_MEM_WRITE_ONLY | CL_MEM_USE_HOST_PTR,
                            sizeof(std::uint32_t), next_aligned.data(), &err);
     OCL_THROW_IF_ERROR(err, "buffer_next");
+    cl::Buffer buffer_stats(context, CL_MEM_WRITE_ONLY | CL_MEM_USE_HOST_PTR,
+                            stats_aligned.size() * sizeof(std::uint32_t),
+                            stats_aligned.data(), &err);
+    OCL_THROW_IF_ERROR(err, "buffer_stats");
 
     OCL_CHECK(err, err = kernel.setArg(3, buffer_params));
     OCL_CHECK(err, err = kernel.setArg(4, buffer_side));
     OCL_CHECK(err, err = kernel.setArg(5, buffer_next));
+    OCL_CHECK(err, err = kernel.setArg(6, buffer_stats));
     OCL_CHECK(err, err = queue.enqueueMigrateMemObjects(
                        {buffer_params, buffer_side}, 0));
     OCL_CHECK(err, err = queue.finish());
@@ -300,10 +333,11 @@ int main(int argc, char** argv) {
 
     for (int pos = 0; pos < args.max_seq; ++pos) {
 #ifdef USE_CPU_ONLY
-      gdn::CpuForward(state, weights, token, logits.data());
+      gdn::CpuForward(state, weights, token, logits.data(), loop_count);
 #else
-      const int fpga_next = gdn::Decode(token, pos == 0, 1, queue, kernel,
-                                        next_aligned.data(), buffer_next);
+      const int fpga_next = gdn::Decode(token, pos == 0, loop_count, queue, kernel,
+                                        next_aligned.data(), buffer_next,
+                                        buffer_stats);
       if (fpga_next < 0) {
         throw std::runtime_error("decode kernel failed");
       }
@@ -331,6 +365,9 @@ int main(int argc, char** argv) {
     const double seconds = std::chrono::duration<double>(end - start).count();
     std::cout << "Time : " << seconds << "[s]\n"
               << "Speed: " << args.max_seq / seconds << "[tok/s]" << std::endl;
+#ifndef USE_CPU_ONLY
+    std::cout << "ring_max_occupancy: " << stats_aligned[0] << std::endl;
+#endif
     std::cout.flush();
     std::exit(EXIT_SUCCESS);
   } catch (const std::exception& e) {

@@ -1,0 +1,5 @@
+T=1 n=16  text matches CPU  116.01 tok/s  ring_max=0
+T=4 n=16  text matches CPU  88.17 tok/s   ring_max=6528
+T=1 n=128 116.399 tok/s  ring_max=0
+T=4 n=128 88.4493 tok/s  ring_max=6528
+prompt=Once  temp=0  clock=150 MHz  routed WNS=+0.340 ns TNS=0
