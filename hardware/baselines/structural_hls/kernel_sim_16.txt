@@ -1,0 +1,21 @@
+built: /home/ruhai/Projects/MixerLoop/hardware/outputs/sim/kernel_sim
+loaded hardware/model/tinystories15m_t1_q8.bin
+packed 273024 words, 1092096 beats, side 62080 floats
+step  0  token     1  kernel  9038  cpu  9038  ok
+step  1  token  9038  kernel  2501  cpu  2501  ok
+step  2  token  2501  kernel   263  cpu   263  ok
+step  3  token   263  kernel   931  cpu   931  ok
+step  4  token   931  kernel 29892  cpu 29892  ok
+step  5  token 29892  kernel   727  cpu   727  ok
+step  6  token   297  kernel   263  cpu   263  ok
+step  7  token   263  kernel  2319  cpu  2319  ok
+step  8  token  2319  kernel  4726  cpu  4726  ok
+step  9  token  4726  kernel 29892  cpu 29892  ok
+step 10  token  4257  kernel  4335  cpu  4335  ok
+step 11  token  4726  kernel 29889  cpu 29889  ok
+step 12  token 29892  kernel   727  cpu   727  ok
+step 13  token 10600  kernel   263  cpu   263  ok
+step 14  token  1023  kernel  7875  cpu  7875  ok
+step 15  token  1900  kernel  7875  cpu  7875  ok
+PASSED (0 mismatch of 16)
+INFO [HLS SIM]: The maximum depth reached by any hls::stream() instance in the design is 236455

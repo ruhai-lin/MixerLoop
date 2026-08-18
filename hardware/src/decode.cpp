@@ -1,38 +1,112 @@
 // Gated DeltaNet 15M single-kernel decoder.
 //
 // Two builds share this file:
-//   * BUILD_DECODE_KERNEL  -> the HLS `decode` top for Vitis HLS. A single
-//     autoregressive step runs entirely on chip: FP32 RMSNorm/conv/recurrence
-//     plus a W8A8 INT8 GEMV engine that streams packed Q8 weights from one HP
-//     port and keeps the recurrent state resident in URAM/BRAM.
-//   * otherwise            -> the CPU reference (USE_CPU_ONLY) that mirrors
-//     references/gdn.c/runq.c bit-for-bit, and the FPGA host glue.
+//   * BUILD_DECODE_KERNEL  -> structural HLS kernel. One canonical DATAFLOW
+//     region; each physical module is a single long-running process.
+//   * otherwise            -> CPU Q8 reference and FPGA host glue. That half
+//     is the numerical oracle and must not change.
 //
-// W8A8 semantics follow runq.c: weights are symmetric int8 with one fp32 scale
-// per 32-lane group; activations are dynamically quantized at each linear
-// boundary; INT8 dot products accumulate in int32 and rescale to fp32.
+// Frozen process graph (do not add compute call sites or split these):
+//   controller, memory_process, scratch_process, weight_router,
+//   q8_process, beta_process, conv_process, rec_process, post_process
+//
+// Rules: one Q8 call site, one HP0 owner (memory_process), each stream
+// SPSC. Shared hardware is one process looping over commands, never many
+// helper call sites. Weight-source mux sits in weight_router; Q8 only sees
+// a unified weight_stream. Recurrence state stays inside rec_process.
 
 #ifdef BUILD_DECODE_KERNEL
 
 #include "decode.hpp"
 
 #include <ap_int.h>
+#include <hls_stream.h>
 #include <float.h>
 #include <math.h>
 #include <stdint.h>
+#ifndef __SYNTHESIS__
+#include <thread>
+#endif
 
 namespace gdn {
 namespace {
 
+constexpr int kVecLanes = 8;
 constexpr int kAccStages = 8;
+constexpr int kHeadGroups = kHeadVDim / kVecLanes;
+constexpr int kSWords = kNumLayers * kNumHeads * kHeadKDim * kHeadGroups;
+constexpr int kConvKinds = 3;
+constexpr int kScratchDepth = 12288;
+constexpr int kScratchBanks = 8;
+constexpr int kMixerCacheBase = 0;
+constexpr int kMixerCacheWords = 5760; // scratch[0, 5759]: current-layer mixer
+constexpr int kQkvgRows = 2 * (kHeadKDim + kHeadVDim);
+constexpr int kMemCmdsPerToken = 1 + kNumLayers * 4 + 2;
+constexpr int kScratchCmdsPerToken = kNumLayers * 3;
+constexpr int kRouteCmdsPerToken = kNumLayers * 4 + 1;
+constexpr int kQ8CmdsPerToken = kNumLayers * 4 + 1;
 
 using ParameterBeat = ap_uint<128>;
 using ParameterWord = ap_uint<512>;
-using Q8ActivationBuffer = int8_t[kHiddenDim];
-using Q8ScaleBuffer = float[kHiddenGroups];
-using ConvState = float[kNumLayers][kKeyDim][kConvSize];
-using RecurrentState = float[kNumLayers][kNumHeads][kStateBanks][kHeadKDim]
-                            [kStateGroups];
+using ConvWord = ap_uint<96>;
+using ActGroup = ap_uint<256>;
+using StateBank = ap_uint<64>;
+
+struct ActTable {
+  ActGroup group[kHiddenGroups];
+  float scale[kHiddenGroups];
+};
+
+struct ActPkt {
+  ActGroup group;
+  float scale;
+};
+
+using ConvHist = ConvWord[kNumLayers][kConvKinds][kKeyDim];
+using StateMem = StateBank[4][kSWords];
+using ScratchMem = StateBank[kScratchBanks][kScratchDepth];
+
+enum MemKind {
+  kMemEmbed = 0,
+  kMemSide,
+  kMemFill,
+  kMemW13,
+  kMemW2,
+  kMemLm,
+  kMemStore
+};
+enum ScratchKind { kScratchFill = 0, kScratchRead };
+enum RouteSrc { kSrcAxi = 0, kSrcSram };
+enum Q8Kind { kQ8Qkvg = 0, kQ8O, kQ8W13, kQ8W2, kQ8Lm };
+
+struct MemCmd {
+  unsigned char kind;
+  unsigned char layer;
+  int token;
+};
+struct ScratchCmd {
+  unsigned char kind;
+  int addr;
+  int count;
+};
+struct RouteCmd {
+  unsigned char src;
+  int count;
+};
+struct Q8Cmd {
+  unsigned char kind;
+  unsigned short rows;
+  unsigned char groups;
+};
+
+static inline uint32_t float_to_bits(float value) {
+  union {
+    float value;
+    uint32_t bits;
+  } converter;
+  converter.value = value;
+  return converter.bits;
+}
 
 static inline float bits_to_float(uint32_t bits) {
   union {
@@ -47,23 +121,37 @@ static inline float unpack_scale(const ParameterWord& word, int row) {
   return bits_to_float(word.range((row + 1) * 32 - 1, row * 32).to_uint());
 }
 
-// A pipelined FP32 adder: a single-cycle fadd is ~13 ns on this part, so every
-// reduction is spread over kAccStages rotating partial sums and only collapsed
-// at the end. This is what lets the reduction loops keep II=1 at 150 MHz.
 static inline float fadd(float a, float b) {
   float y = a + b;
 #pragma HLS BIND_OP variable = y op = fadd impl = fulldsp latency = 6
   return y;
 }
 
-static inline void clear_acc(float acc[kAccStages]) {
-  for (int stage = 0; stage < kAccStages; ++stage) {
+static inline float fsub(float a, float b) {
+  float y = a - b;
+#pragma HLS BIND_OP variable = y op = fsub impl = fulldsp latency = 6
+  return y;
+}
+
+static inline float fmul(float a, float b) {
+  float y = a * b;
+#pragma HLS BIND_OP variable = y op = fmul impl = maxdsp latency = 4
+  return y;
+}
+
+static inline void vec_clear(float acc[kVecLanes][kAccStages]) {
+#pragma HLS INLINE
+  for (int lane = 0; lane < kVecLanes; ++lane) {
 #pragma HLS UNROLL
-    acc[stage] = 0.0f;
+    for (int stage = 0; stage < kAccStages; ++stage) {
+#pragma HLS UNROLL
+      acc[lane][stage] = 0.0f;
+    }
   }
 }
 
-static inline float reduce_acc(const float acc[kAccStages]) {
+static inline float reduce8(const float acc[kAccStages]) {
+#pragma HLS INLINE
   const float sum01 = fadd(acc[0], acc[1]);
   const float sum23 = fadd(acc[2], acc[3]);
   const float sum45 = fadd(acc[4], acc[5]);
@@ -71,21 +159,185 @@ static inline float reduce_acc(const float acc[kAccStages]) {
   return fadd(fadd(sum01, sum23), fadd(sum45, sum67));
 }
 
-static inline float siluf(float x);
+enum SfuOp { kSfuExp = 0, kSfuLog1p, kSfuSqrt, kSfuRecip };
 
-// ---------------------------------------------------------------------------
-// One streaming Q8 engine for every projection, paired W1/W3 and LM argmax.
-// A logical 512-bit word arrives as four 128-bit HP0 beats; arithmetic is done
-// in the same II=4 loop, so there is no ParameterTile or score spill buffer.
-// ---------------------------------------------------------------------------
-static uint32_t q8_linear(float* output, const ParameterBeat* params,
-                          int word_offset, int rows, int group_count,
-                          const Q8ActivationBuffer& activation,
-                          const Q8ScaleBuffer& scales, bool paired,
-                          bool argmax_mode) {
-#pragma HLS INLINE off
-#pragma HLS ARRAY_PARTITION variable = activation cyclic factor = 32 dim = 1
-#pragma HLS ARRAY_PARTITION variable = scales complete dim = 1
+static inline float sfu(int op, float x) {
+#pragma HLS INLINE
+  if (op == kSfuExp) {
+    return expf(x);
+  }
+  if (op == kSfuLog1p) {
+    return log1pf(x);
+  }
+  if (op == kSfuSqrt) {
+    return sqrtf(x);
+  }
+  return 1.0f / x;
+}
+
+static inline float sfu_exp(float x) {
+#pragma HLS INLINE
+  return sfu(kSfuExp, x);
+}
+static inline float sfu_log1p(float x) {
+#pragma HLS INLINE
+  return sfu(kSfuLog1p, x);
+}
+static inline float sfu_sqrt(float x) {
+#pragma HLS INLINE
+  return sfu(kSfuSqrt, x);
+}
+static inline float sfu_recip(float x) {
+#pragma HLS INLINE
+  return sfu(kSfuRecip, x);
+}
+static inline float sfu_sigmoid(float x) {
+#pragma HLS INLINE
+  return sfu_recip(1.0f + sfu_exp(-x));
+}
+static inline float sfu_silu(float x) {
+#pragma HLS INLINE
+  return fmul(x, sfu_sigmoid(x));
+}
+static inline float sfu_softplus(float x) {
+#pragma HLS INLINE
+  return x > 20.0f ? x : sfu_log1p(sfu_exp(x));
+}
+static inline float sfu_rsqrt(float x) {
+#pragma HLS INLINE
+  return sfu_recip(sfu_sqrt(x));
+}
+
+static inline int state_addr(int layer, int head, int row, int group) {
+#pragma HLS INLINE
+  return ((layer * kNumHeads + head) * kHeadKDim + row) * kHeadGroups + group;
+}
+
+static inline StateBank pack2(float a, float b) {
+#pragma HLS INLINE
+  StateBank word = 0;
+  word.range(31, 0) = float_to_bits(a);
+  word.range(63, 32) = float_to_bits(b);
+  return word;
+}
+
+static inline void unpack2(StateBank word, float& a, float& b) {
+#pragma HLS INLINE
+  a = bits_to_float(word.range(31, 0).to_uint());
+  b = bits_to_float(word.range(63, 32).to_uint());
+}
+
+static inline void s_load(const StateMem banks, int addr, float lane[kVecLanes]) {
+#pragma HLS INLINE
+  for (int b = 0; b < 4; ++b) {
+#pragma HLS UNROLL
+    unpack2(banks[b][addr], lane[2 * b], lane[2 * b + 1]);
+  }
+}
+
+static inline void s_store(StateMem banks, int addr, const float lane[kVecLanes]) {
+#pragma HLS INLINE
+  for (int b = 0; b < 4; ++b) {
+#pragma HLS UNROLL
+    banks[b][addr] = pack2(lane[2 * b], lane[2 * b + 1]);
+  }
+}
+
+static inline ConvWord pack3(float a, float b, float c) {
+#pragma HLS INLINE
+  ConvWord word = 0;
+  word.range(31, 0) = float_to_bits(a);
+  word.range(63, 32) = float_to_bits(b);
+  word.range(95, 64) = float_to_bits(c);
+  return word;
+}
+
+static inline void unpack3(ConvWord word, float& a, float& b, float& c) {
+#pragma HLS INLINE
+  a = bits_to_float(word.range(31, 0).to_uint());
+  b = bits_to_float(word.range(63, 32).to_uint());
+  c = bits_to_float(word.range(95, 64).to_uint());
+}
+
+static inline ParameterWord read_word(const ParameterBeat* params, int offset) {
+#pragma HLS INLINE
+  const int beat = offset * kBeatsPerWord;
+  ParameterWord word;
+  word.range(127, 0) = params[beat + 0];
+  word.range(255, 128) = params[beat + 1];
+  word.range(383, 256) = params[beat + 2];
+  word.range(511, 384) = params[beat + 3];
+  return word;
+}
+
+static void pack_act_group(ActTable& act, int group,
+                           const int8_t lanes[kQuantGroupSize], float scale) {
+#pragma HLS INLINE
+  ActGroup packed = 0;
+  for (int lane = 0; lane < kQuantGroupSize; ++lane) {
+#pragma HLS UNROLL
+    packed.range((lane + 1) * 8 - 1, lane * 8) =
+        static_cast<uint8_t>(lanes[lane]);
+  }
+  act.group[group] = packed;
+  act.scale[group] = scale;
+}
+
+static void unpack_act_group(const ActTable& act, int group,
+                             int8_t lanes[kQuantGroupSize], float& scale) {
+#pragma HLS INLINE
+  const ActGroup packed = act.group[group];
+  scale = act.scale[group];
+  for (int lane = 0; lane < kQuantGroupSize; ++lane) {
+#pragma HLS UNROLL
+    lanes[lane] = static_cast<int8_t>(
+        packed.range((lane + 1) * 8 - 1, lane * 8).to_int());
+  }
+}
+
+static int q8_word_count(int rows, int group_count, bool paired) {
+#pragma HLS INLINE
+  return rows / kPackedRows * group_count * kWordsPerGroup * (paired ? 2 : 1);
+}
+
+static ParameterWord scratch_read(const ScratchMem scratch, int addr) {
+#pragma HLS INLINE
+  ParameterWord word;
+  for (int bank = 0; bank < kScratchBanks; ++bank) {
+#pragma HLS UNROLL
+    word.range((bank + 1) * 64 - 1, bank * 64) = scratch[bank][addr];
+  }
+  return word;
+}
+
+static void scratch_write(ScratchMem scratch, int addr, ParameterWord word) {
+#pragma HLS INLINE
+  for (int bank = 0; bank < kScratchBanks; ++bank) {
+#pragma HLS UNROLL
+    scratch[bank][addr] = word.range((bank + 1) * 64 - 1, bank * 64);
+  }
+}
+
+static void stream_write_vec(hls::stream<float>& dst, const float* src, int n) {
+#pragma HLS INLINE
+  for (int i = 0; i < n; ++i) {
+#pragma HLS PIPELINE II = 1
+    dst.write(src[i]);
+  }
+}
+
+static void stream_read_vec(hls::stream<float>& src, float* dst, int n) {
+#pragma HLS INLINE
+  for (int i = 0; i < n; ++i) {
+#pragma HLS PIPELINE II = 1
+    dst[i] = src.read();
+  }
+}
+
+static void q8_consume(float* output, hls::stream<ParameterWord>& words, int count,
+                       int rows, int group_count, const ActTable& act, bool paired,
+                       bool argmax_mode, uint32_t* result) {
+#pragma HLS INLINE
 
   float acc0[kPackedRows];
   float acc1[kPackedRows];
@@ -106,32 +358,23 @@ static uint32_t q8_linear(float* output, const ParameterBeat* params,
     best_row[stage] = 0;
   }
 
-  const int words = rows / kPackedRows * group_count * kWordsPerGroup *
-                    (paired ? 2 : 1);
   int block = 0;
   int group = 0;
   int matrix = 0;
   int word_in_group = 0;
   const int last_group = group_count - 1;
 
-  for (int it = 0; it < words; ++it) {
-#pragma HLS PIPELINE II = 4
+  for (int it = 0; it < count; ++it) {
+#pragma HLS PIPELINE II = 1
 #pragma HLS DEPENDENCE variable = acc0 inter false
 #pragma HLS DEPENDENCE variable = acc1 inter false
-    const int beat = (word_offset + it) * kBeatsPerWord;
-    ParameterWord word;
-    word.range(127, 0) = params[beat + 0];
-    word.range(255, 128) = params[beat + 1];
-    word.range(383, 256) = params[beat + 2];
-    word.range(511, 384) = params[beat + 3];
+#pragma HLS DEPENDENCE variable = best_score inter false
+#pragma HLS DEPENDENCE variable = best_row inter false
+    const ParameterWord word = words.read();
 
     if (word_in_group == 0) {
       scale_word = word;
-      input_scale = scales[group];
-      for (int lane = 0; lane < kQuantGroupSize; ++lane) {
-#pragma HLS UNROLL
-        input_group[lane] = activation[group * kQuantGroupSize + lane];
-      }
+      unpack_act_group(act, group, input_group, input_scale);
     } else {
       const int pair = word_in_group - 1;
       const int row0 = pair * 2;
@@ -151,10 +394,10 @@ static uint32_t q8_linear(float* output, const ParameterBeat* params,
           static_cast<float>(dot0) * input_scale * unpack_scale(scale_word, row0);
       const float partial1 =
           static_cast<float>(dot1) * input_scale * unpack_scale(scale_word, row1);
-      const float prev0 = group == 0 ? 0.0f
-                                     : (matrix == 0 ? acc0[row0] : acc1[row0]);
-      const float prev1 = group == 0 ? 0.0f
-                                     : (matrix == 0 ? acc0[row1] : acc1[row1]);
+      const float prev0 =
+          group == 0 ? 0.0f : (matrix == 0 ? acc0[row0] : acc1[row0]);
+      const float prev1 =
+          group == 0 ? 0.0f : (matrix == 0 ? acc0[row1] : acc1[row1]);
       const float sum0 = fadd(prev0, partial0);
       const float sum1 = fadd(prev1, partial1);
       if (matrix == 0) {
@@ -165,25 +408,26 @@ static uint32_t q8_linear(float* output, const ParameterBeat* params,
         acc1[row1] = sum1;
       }
 
-      if (group == last_group && (!paired || matrix == 1)) {
+      if (group == last_group) {
         const int output_row0 = block * kPackedRows + row0;
         const int output_row1 = output_row0 + 1;
-        const float value0 = paired ? siluf(acc0[row0]) * sum0 : sum0;
-        const float value1 = paired ? siluf(acc0[row1]) * sum1 : sum1;
         if (argmax_mode) {
-          const int stage0 = output_row0 & (kAccStages - 1);
-          const int stage1 = output_row1 & (kAccStages - 1);
-          if (value0 > best_score[stage0]) {
-            best_score[stage0] = value0;
-            best_row[stage0] = output_row0;
-          }
-          if (value1 > best_score[stage1]) {
-            best_score[stage1] = value1;
-            best_row[stage1] = output_row1;
+          if (!paired || matrix == 1) {
+            const int stage0 = output_row0 & (kAccStages - 1);
+            const int stage1 = output_row1 & (kAccStages - 1);
+            if (sum0 > best_score[stage0]) {
+              best_score[stage0] = sum0;
+              best_row[stage0] = output_row0;
+            }
+            if (sum1 > best_score[stage1]) {
+              best_score[stage1] = sum1;
+              best_row[stage1] = output_row1;
+            }
           }
         } else {
-          output[output_row0] = value0;
-          output[output_row1] = value1;
+          const int base = (paired && matrix == 1) ? rows : 0;
+          output[base + output_row0] = sum0;
+          output[base + output_row1] = sum1;
         }
       }
     }
@@ -213,233 +457,395 @@ static uint32_t q8_linear(float* output, const ParameterBeat* params,
       final_row = best_row[stage];
     }
   }
-  return final_row;
-}
-
-// ---------------------------------------------------------------------------
-// Controller-side primitives (FP32).
-// ---------------------------------------------------------------------------
-static inline float sigmoidf(float x) { return 1.0f / (1.0f + expf(-x)); }
-static inline float siluf(float x) { return x * sigmoidf(x); }
-static inline float softplusf(float x) {
-  return x > 20.0f ? x : log1pf(expf(x));
-}
-
-template <int Size>
-static void quantize(Q8ActivationBuffer& out, Q8ScaleBuffer& scales,
-                     const float in[Size]) {
-  for (int group = 0; group < Size / kQuantGroupSize; ++group) {
-    float lane_max[kAccStages];
-#pragma HLS ARRAY_PARTITION variable = lane_max complete dim = 1
-    for (int stage = 0; stage < kAccStages; ++stage) {
-#pragma HLS UNROLL
-      lane_max[stage] = 0.0f;
-    }
-    for (int lane = 0; lane < kQuantGroupSize; ++lane) {
-#pragma HLS PIPELINE II = 1
-#pragma HLS DEPENDENCE variable = lane_max inter false
-      const float value = fabsf(in[group * kQuantGroupSize + lane]);
-      const int stage = lane & (kAccStages - 1);
-      if (value > lane_max[stage]) {
-        lane_max[stage] = value;
-      }
-    }
-    float max_abs = 0.0f;
-    for (int stage = 0; stage < kAccStages; ++stage) {
-#pragma HLS UNROLL
-      if (lane_max[stage] > max_abs) {
-        max_abs = lane_max[stage];
-      }
-    }
-    const float scale = max_abs / 127.0f;
-    scales[group] = scale == 0.0f ? 1.0f : scale;
-    for (int lane = 0; lane < kQuantGroupSize; ++lane) {
-#pragma HLS PIPELINE II = 1
-      const int index = group * kQuantGroupSize + lane;
-      float value = scale == 0.0f ? 0.0f : nearbyintf(in[index] / scale);
-      if (value > 127.0f) {
-        value = 127.0f;
-      } else if (value < -127.0f) {
-        value = -127.0f;
-      }
-      out[index] = static_cast<int8_t>(value);
-    }
+  if (argmax_mode) {
+    *result = final_row;
   }
 }
 
-template <int Size>
-static void rmsnorm(float out[Size], const float in[Size],
-                    const float* weight) {
+static void fp8_rmsnorm(float* out, const float* in, const float* weight,
+                        int size) {
+#pragma HLS INLINE
   float acc[kAccStages];
 #pragma HLS ARRAY_PARTITION variable = acc complete dim = 1
-  clear_acc(acc);
-  for (int i = 0; i < Size; ++i) {
-#pragma HLS PIPELINE II = 1
-#pragma HLS DEPENDENCE variable = acc inter false
-    const int stage = i & (kAccStages - 1);
-    acc[stage] = fadd(acc[stage], in[i] * in[i]);
+  for (int stage = 0; stage < kAccStages; ++stage) {
+#pragma HLS UNROLL
+    acc[stage] = 0.0f;
   }
-  const float norm = 1.0f / sqrtf(reduce_acc(acc) / Size + 1e-5f);
-  for (int i = 0; i < Size; ++i) {
-#pragma HLS PIPELINE II = 1
-    out[i] = weight[i] * (in[i] * norm);
-  }
-}
-
-static float dot(const float* a, const float* b, int size) {
-  float acc[kAccStages];
-#pragma HLS ARRAY_PARTITION variable = acc complete dim = 1
-  clear_acc(acc);
   for (int i = 0; i < size; ++i) {
 #pragma HLS PIPELINE II = 1
 #pragma HLS DEPENDENCE variable = acc inter false
     const int stage = i & (kAccStages - 1);
-    acc[stage] = fadd(acc[stage], a[i] * b[i]);
+    acc[stage] = fadd(acc[stage], fmul(in[i], in[i]));
   }
-  return reduce_acc(acc);
-}
-
-// conv_size is 4, so the delay line shifts and the tap dot product both fully
-// unroll into a 2-level adder tree; one channel per cycle.
-static void conv_step(float* channels, float state[][kConvSize],
-                      const float* weight, int count, bool valid) {
-  // Splitting the tap dimension gives the shift register one memory per tap, so
-  // the whole delay line updates in a single cycle.
-#pragma HLS ARRAY_PARTITION variable = state complete dim = 2
-  for (int c = 0; c < count; ++c) {
+  const float inv =
+      sfu_rsqrt(fadd(fmul(reduce8(acc), sfu_recip(static_cast<float>(size))),
+                     1e-5f));
+  for (int i = 0; i < size; ++i) {
 #pragma HLS PIPELINE II = 1
-    float taps[kConvSize];
-#pragma HLS ARRAY_PARTITION variable = taps complete dim = 1
-    for (int j = 0; j < kConvSize - 1; ++j) {
-#pragma HLS UNROLL
-      taps[j] = valid ? state[c][j + 1] : 0.0f;
-    }
-    taps[kConvSize - 1] = channels[c];
-
-    float products[kConvSize];
-#pragma HLS ARRAY_PARTITION variable = products complete dim = 1
-    for (int j = 0; j < kConvSize; ++j) {
-#pragma HLS UNROLL
-      state[c][j] = taps[j];
-      products[j] = taps[j] * weight[c * kConvSize + j];
-    }
-    const float sum =
-        fadd(fadd(products[0], products[1]), fadd(products[2], products[3]));
-    channels[c] = siluf(sum);
+    out[i] = fmul(weight[i], fmul(in[i], inv));
   }
 }
 
-// Sixteen value-column banks turn the 32x32 state into two 64-cycle sweeps.
-static void recurrence_head(
-    float S[kStateBanks][kHeadKDim][kStateGroups], const float* q,
-    const float* k, const float* v, float beta, float decay, bool valid,
-    float* out) {
-#pragma HLS INLINE off
-  float prediction[kHeadVDim];
-  float delta[kHeadVDim];
-#pragma HLS ARRAY_PARTITION variable = S complete dim = 1
-#pragma HLS ARRAY_PARTITION variable = prediction complete dim = 1
-#pragma HLS ARRAY_PARTITION variable = delta complete dim = 1
-#pragma HLS ARRAY_PARTITION variable = out complete dim = 1
-
-  for (int group = 0; group < kStateGroups; ++group) {
-#pragma HLS LOOP_FLATTEN off
-    float acc[kStateBanks][kAccStages];
-#pragma HLS ARRAY_PARTITION variable = acc complete dim = 0
-    for (int bank = 0; bank < kStateBanks; ++bank) {
+static void fp8_quantize_group(ActTable& act, int group, const float* in) {
+#pragma HLS INLINE
+  float lane_max[kAccStages];
+#pragma HLS ARRAY_PARTITION variable = lane_max complete dim = 1
+  for (int stage = 0; stage < kAccStages; ++stage) {
 #pragma HLS UNROLL
-      for (int stage = 0; stage < kAccStages; ++stage) {
-#pragma HLS UNROLL
-        acc[bank][stage] = 0.0f;
-      }
-    }
-    for (int i = 0; i < kHeadKDim; ++i) {
+    lane_max[stage] = 0.0f;
+  }
+  for (int lane = 0; lane < kQuantGroupSize; ++lane) {
 #pragma HLS PIPELINE II = 1
-#pragma HLS DEPENDENCE variable = acc inter false
-      const int stage = i & (kAccStages - 1);
-      for (int bank = 0; bank < kStateBanks; ++bank) {
-#pragma HLS UNROLL
-        const float decayed = (valid ? S[bank][i][group] : 0.0f) * decay;
-        S[bank][i][group] = decayed;
-        acc[bank][stage] = fadd(acc[bank][stage], decayed * k[i]);
-      }
-    }
-    for (int bank = 0; bank < kStateBanks; ++bank) {
-#pragma HLS UNROLL
-      prediction[group * kStateBanks + bank] = reduce_acc(acc[bank]);
+#pragma HLS DEPENDENCE variable = lane_max inter false
+    const float value = fabsf(in[lane]);
+    const int stage = lane & (kAccStages - 1);
+    if (value > lane_max[stage]) {
+      lane_max[stage] = value;
     }
   }
-  for (int j = 0; j < kHeadVDim; ++j) {
-#pragma HLS PIPELINE II = 1
-    delta[j] = (v[j] - prediction[j]) * beta;
+  float wmax = lane_max[0];
+  for (int stage = 1; stage < kAccStages; ++stage) {
+    if (lane_max[stage] > wmax) {
+      wmax = lane_max[stage];
+    }
   }
-
-  for (int group = 0; group < kStateGroups; ++group) {
-#pragma HLS LOOP_FLATTEN off
-    float acc[kStateBanks][kAccStages];
-#pragma HLS ARRAY_PARTITION variable = acc complete dim = 0
-    for (int bank = 0; bank < kStateBanks; ++bank) {
+  int8_t lanes[kQuantGroupSize];
+#pragma HLS ARRAY_PARTITION variable = lanes complete dim = 1
+  if (wmax == 0.0f) {
+    for (int lane = 0; lane < kQuantGroupSize; ++lane) {
 #pragma HLS UNROLL
-      for (int stage = 0; stage < kAccStages; ++stage) {
-#pragma HLS UNROLL
-        acc[bank][stage] = 0.0f;
-      }
+      lanes[lane] = 0;
     }
-    for (int i = 0; i < kHeadKDim; ++i) {
+    pack_act_group(act, group, lanes, 1.0f);
+  } else {
+    const float scale = wmax / 127.0f;
+    const float inv_scale = sfu_recip(scale);
+    for (int lane = 0; lane < kQuantGroupSize; ++lane) {
 #pragma HLS PIPELINE II = 1
-#pragma HLS DEPENDENCE variable = acc inter false
-      const int stage = i & (kAccStages - 1);
-      for (int bank = 0; bank < kStateBanks; ++bank) {
-#pragma HLS UNROLL
-        const int j = group * kStateBanks + bank;
-        const float updated = fadd(S[bank][i][group], k[i] * delta[j]);
-        S[bank][i][group] = updated;
-        acc[bank][stage] = fadd(acc[bank][stage], q[i] * updated);
-      }
+      int quantized = static_cast<int>(roundf(fmul(in[lane], inv_scale)));
+      if (quantized > 127) quantized = 127;
+      if (quantized < -127) quantized = -127;
+      lanes[lane] = static_cast<int8_t>(quantized);
     }
-    for (int bank = 0; bank < kStateBanks; ++bank) {
-#pragma HLS UNROLL
-      out[group * kStateBanks + bank] = reduce_acc(acc[bank]);
-    }
+    pack_act_group(act, group, lanes, scale);
   }
 }
 
-static void head_rmsnorm_gated(float* x, const float* gate,
-                               const float* weight) {
+static void fp8_quantize(ActTable& act, const float* in, int size) {
+#pragma HLS INLINE
+  const int groups = size / kQuantGroupSize;
+  for (int group = 0; group < groups; ++group) {
+    fp8_quantize_group(act, group, in + group * kQuantGroupSize);
+  }
+}
+
+static void emit_act(hls::stream<ActPkt>& acts, const ActTable& act, int groups) {
+#pragma HLS INLINE
+  for (int group = 0; group < groups; ++group) {
+#pragma HLS PIPELINE II = 1
+    ActPkt pkt;
+    pkt.group = act.group[group];
+    pkt.scale = act.scale[group];
+    acts.write(pkt);
+  }
+}
+
+static void load_act(hls::stream<ActPkt>& acts, ActTable& act, int groups) {
+#pragma HLS INLINE
+  for (int group = 0; group < groups; ++group) {
+#pragma HLS PIPELINE II = 1
+    const ActPkt pkt = acts.read();
+    act.group[group] = pkt.group;
+    act.scale[group] = pkt.scale;
+  }
+}
+
+static float fp8_dot(const float* a, const float* b, int size) {
+#pragma HLS INLINE
   float acc[kAccStages];
 #pragma HLS ARRAY_PARTITION variable = acc complete dim = 1
-  clear_acc(acc);
+  for (int stage = 0; stage < kAccStages; ++stage) {
+#pragma HLS UNROLL
+    acc[stage] = 0.0f;
+  }
+  for (int i = 0; i < size; ++i) {
+#pragma HLS PIPELINE II = 1
+#pragma HLS DEPENDENCE variable = acc inter false
+    const int stage = i & (kAccStages - 1);
+    acc[stage] = fadd(acc[stage], fmul(a[i], b[i]));
+  }
+  return reduce8(acc);
+}
+
+static void fp8_conv(float* channels, ConvHist hist, int layer, int kind,
+                     int channel_base,
+                     const float weight[kConvKinds][kKeyDim][kConvSize],
+                     int count, bool valid) {
+#pragma HLS INLINE
+  for (int c = 0; c < count; ++c) {
+#pragma HLS PIPELINE II = 1
+    const int ch = channel_base + c;
+    float h0, h1, h2;
+    unpack3(hist[layer][kind][ch], h0, h1, h2);
+    const float t0 = valid ? h0 : 0.0f;
+    const float t1 = valid ? h1 : 0.0f;
+    const float t2 = valid ? h2 : 0.0f;
+    const float t3 = channels[c];
+    const float sum =
+        fadd(fadd(fmul(t0, weight[kind][ch][0]), fmul(t1, weight[kind][ch][1])),
+             fadd(fmul(t2, weight[kind][ch][2]), fmul(t3, weight[kind][ch][3])));
+    channels[c] = sum;
+    hist[layer][kind][ch] = pack3(t1, t2, t3);
+  }
+  for (int c = 0; c < count; ++c) {
+    channels[c] = sfu_silu(channels[c]);
+  }
+}
+
+static void fp8_l2scale(float* x, int size, float extra_scale) {
+#pragma HLS INLINE
+  float acc[kAccStages];
+#pragma HLS ARRAY_PARTITION variable = acc complete dim = 1
+  for (int stage = 0; stage < kAccStages; ++stage) {
+#pragma HLS UNROLL
+    acc[stage] = 0.0f;
+  }
+  for (int i = 0; i < size; ++i) {
+#pragma HLS PIPELINE II = 1
+#pragma HLS DEPENDENCE variable = acc inter false
+    const int stage = i & (kAccStages - 1);
+    acc[stage] = fadd(acc[stage], fmul(x[i], x[i]));
+  }
+  const float inv = fmul(sfu_rsqrt(reduce8(acc) + 1e-6f), extra_scale);
+  for (int i = 0; i < size; ++i) {
+#pragma HLS PIPELINE II = 1
+    x[i] = fmul(x[i], inv);
+  }
+}
+
+static void fp8_recurrence(StateMem S, int layer, int head, const float* q,
+                           const float* k, const float* v, float beta,
+                           float decay, bool valid, float* out) {
+#pragma HLS INLINE
+  float prediction[kHeadVDim];
+  float delta[kHeadVDim];
+#pragma HLS ARRAY_PARTITION variable = prediction complete dim = 1
+#pragma HLS ARRAY_PARTITION variable = delta complete dim = 1
+
+  for (int g = 0; g < kHeadGroups; ++g) {
+    float acc[kVecLanes][kAccStages];
+#pragma HLS ARRAY_PARTITION variable = acc complete dim = 0
+    vec_clear(acc);
+    for (int i = 0; i < kHeadKDim; ++i) {
+#pragma HLS PIPELINE II = 1
+#pragma HLS DEPENDENCE variable = acc inter false
+      const int stage = i & (kAccStages - 1);
+      const int addr = state_addr(layer, head, i, g);
+      float lane[kVecLanes];
+#pragma HLS ARRAY_PARTITION variable = lane complete dim = 1
+      s_load(S, addr, lane);
+      for (int l = 0; l < kVecLanes; ++l) {
+#pragma HLS UNROLL
+        const float decayed = fmul(valid ? lane[l] : 0.0f, decay);
+        lane[l] = decayed;
+        acc[l][stage] = fadd(acc[l][stage], fmul(decayed, k[i]));
+      }
+      s_store(S, addr, lane);
+    }
+    for (int l = 0; l < kVecLanes; ++l) {
+#pragma HLS UNROLL
+      prediction[g * kVecLanes + l] = reduce8(acc[l]);
+    }
+  }
+
+  for (int j = 0; j < kHeadVDim; ++j) {
+#pragma HLS PIPELINE II = 1
+    delta[j] = fmul(fsub(v[j], prediction[j]), beta);
+  }
+
+  for (int g = 0; g < kHeadGroups; ++g) {
+    float acc[kVecLanes][kAccStages];
+#pragma HLS ARRAY_PARTITION variable = acc complete dim = 0
+    vec_clear(acc);
+    for (int i = 0; i < kHeadKDim; ++i) {
+#pragma HLS PIPELINE II = 1
+#pragma HLS DEPENDENCE variable = acc inter false
+      const int stage = i & (kAccStages - 1);
+      const int addr = state_addr(layer, head, i, g);
+      float lane[kVecLanes];
+#pragma HLS ARRAY_PARTITION variable = lane complete dim = 1
+      s_load(S, addr, lane);
+      for (int l = 0; l < kVecLanes; ++l) {
+#pragma HLS UNROLL
+        const float updated =
+            fadd(lane[l], fmul(k[i], delta[g * kVecLanes + l]));
+        lane[l] = updated;
+        acc[l][stage] = fadd(acc[l][stage], fmul(q[i], updated));
+      }
+      s_store(S, addr, lane);
+    }
+    for (int l = 0; l < kVecLanes; ++l) {
+#pragma HLS UNROLL
+      out[g * kVecLanes + l] = reduce8(acc[l]);
+    }
+  }
+}
+
+static void fp8_head_norm_gate(float* x, const float* gate, const float* weight) {
+#pragma HLS INLINE
+  float acc[kAccStages];
+#pragma HLS ARRAY_PARTITION variable = acc complete dim = 1
+  for (int stage = 0; stage < kAccStages; ++stage) {
+#pragma HLS UNROLL
+    acc[stage] = 0.0f;
+  }
   for (int i = 0; i < kHeadVDim; ++i) {
 #pragma HLS PIPELINE II = 1
 #pragma HLS DEPENDENCE variable = acc inter false
     const int stage = i & (kAccStages - 1);
-    acc[stage] = fadd(acc[stage], x[i] * x[i]);
+    acc[stage] = fadd(acc[stage], fmul(x[i], x[i]));
   }
-  const float norm = 1.0f / sqrtf(reduce_acc(acc) / kHeadVDim + 1e-5f);
+  const float inv =
+      sfu_rsqrt(fadd(fmul(reduce8(acc), sfu_recip(static_cast<float>(kHeadVDim))),
+                     1e-5f));
   for (int i = 0; i < kHeadVDim; ++i) {
-#pragma HLS PIPELINE II = 1
-    x[i] = weight[i] * (x[i] * norm) * siluf(gate[i]);
+    x[i] = fmul(weight[i], fmul(fmul(x[i], inv), sfu_silu(gate[i])));
   }
 }
 
-static ParameterWord read_word(const ParameterBeat* params, int offset) {
+static void fp8_w13_fuse(float* fused, const float* w1, const float* w3) {
 #pragma HLS INLINE
-  const int beat = offset * kBeatsPerWord;
-  ParameterWord word;
-  word.range(127, 0) = params[beat + 0];
-  word.range(255, 128) = params[beat + 1];
-  word.range(383, 256) = params[beat + 2];
-  word.range(511, 384) = params[beat + 3];
-  return word;
+  for (int i = 0; i < kHiddenDim; ++i) {
+    fused[i] = fmul(sfu_silu(w1[i]), w3[i]);
+  }
 }
 
-static void load_embedding(float x[kDim], const ParameterBeat* params,
+static void fp8_residual(float* x, const float* y, int size) {
+#pragma HLS INLINE
+  for (int i = 0; i < size; ++i) {
+#pragma HLS PIPELINE II = 1
+    x[i] = fadd(x[i], y[i]);
+  }
+}
+
+static void fp8_beta_decay(const float* norm, const float* b_proj,
+                           const float* a_proj, float a_decay, float dt_bias,
+                           float& beta, float& decay) {
+#pragma HLS INLINE
+  beta = sfu_sigmoid(fp8_dot(norm, b_proj, kDim));
+  decay = sfu_exp(fmul(
+      a_decay, sfu_softplus(fadd(fp8_dot(norm, a_proj, kDim), dt_bias))));
+}
+
+static void controller(int token, int reset_state, hls::stream<MemCmd>& mem_cmds,
+                       hls::stream<ScratchCmd>& scratch_cmds,
+                       hls::stream<RouteCmd>& route_cmds,
+                       hls::stream<Q8Cmd>& q8_cmds, hls::stream<int>& conv_reset,
+                       hls::stream<int>& rec_reset) {
+#pragma HLS INLINE off
+  conv_reset.write(reset_state);
+  rec_reset.write(reset_state);
+
+  MemCmd mem;
+  mem.kind = kMemEmbed;
+  mem.layer = 0;
+  mem.token = token;
+  mem_cmds.write(mem);
+
+  for (int layer = 0; layer < kNumLayers; ++layer) {
+#pragma HLS LOOP_TRIPCOUNT min = 8 max = 8
+    mem.kind = kMemSide;
+    mem.layer = static_cast<unsigned char>(layer);
+    mem_cmds.write(mem);
+
+    mem.kind = kMemFill;
+    mem_cmds.write(mem);
+
+    ScratchCmd sc;
+    sc.kind = kScratchFill;
+    sc.addr = kMixerCacheBase;
+    sc.count = kMixerCacheWords;
+    scratch_cmds.write(sc);
+
+    sc.kind = kScratchRead;
+    sc.addr = 0;
+    sc.count = kPackedQKVGWords;
+    scratch_cmds.write(sc);
+
+    RouteCmd rt;
+    rt.src = kSrcSram;
+    rt.count = kPackedQKVGWords;
+    route_cmds.write(rt);
+
+    Q8Cmd q8;
+    q8.kind = kQ8Qkvg;
+    q8.rows = kQkvgRows;
+    q8.groups = kDimGroups;
+    q8_cmds.write(q8);
+
+    sc.addr = kPackedQKVGWords;
+    sc.count = kPackedProjWords;
+    scratch_cmds.write(sc);
+    rt.count = kPackedProjWords;
+    route_cmds.write(rt);
+    q8.kind = kQ8O;
+    q8.rows = kDim;
+    q8.groups = kValueGroups;
+    q8_cmds.write(q8);
+
+    mem.kind = kMemW13;
+    mem_cmds.write(mem);
+    rt.src = kSrcAxi;
+    rt.count = 2 * kPackedW13Words;
+    route_cmds.write(rt);
+    q8.kind = kQ8W13;
+    q8.rows = kHiddenDim;
+    q8.groups = kDimGroups;
+    q8_cmds.write(q8);
+
+    mem.kind = kMemW2;
+    mem_cmds.write(mem);
+    rt.count = kPackedW2Words;
+    route_cmds.write(rt);
+    q8.kind = kQ8W2;
+    q8.rows = kDim;
+    q8.groups = kHiddenGroups;
+    q8_cmds.write(q8);
+  }
+
+  mem.kind = kMemLm;
+  mem.layer = 0;
+  mem_cmds.write(mem);
+  RouteCmd rt;
+  rt.src = kSrcAxi;
+  rt.count = kPackedTokWords;
+  route_cmds.write(rt);
+  Q8Cmd q8;
+  q8.kind = kQ8Lm;
+  q8.rows = kVocabSize;
+  q8.groups = kDimGroups;
+  q8_cmds.write(q8);
+  mem.kind = kMemStore;
+  mem_cmds.write(mem);
+}
+
+static void axi_words(hls::stream<ParameterWord>& dst, const ParameterBeat* params,
+                      int offset, int count) {
+#pragma HLS INLINE
+  for (int it = 0; it < count; ++it) {
+#pragma HLS PIPELINE II = 4
+    dst.write(read_word(params, offset + it));
+  }
+}
+
+static void load_embedding(hls::stream<float>& out, const ParameterBeat* params,
                            int token) {
+#pragma HLS INLINE
   const int row = token % kPackedRows;
   const int pair = row / 2;
   const int half = row & 1;
-  const int base = kPackedTokOffset +
-                   token / kPackedRows * kDimGroups * kWordsPerGroup;
+  const int base =
+      kPackedTokOffset + token / kPackedRows * kDimGroups * kWordsPerGroup;
   for (int group = 0; group < kDimGroups; ++group) {
     const ParameterWord scale_word =
         read_word(params, base + group * kWordsPerGroup);
@@ -450,17 +856,242 @@ static void load_embedding(float x[kDim], const ParameterBeat* params,
 #pragma HLS PIPELINE II = 1
       const int bit = (half * kQuantGroupSize + lane) * 8;
       const ap_int<8> value = weight_word.range(bit + 7, bit);
-      x[group * kQuantGroupSize + lane] = value.to_int() * scale;
+      out.write(static_cast<float>(value.to_int()) * scale);
     }
   }
 }
 
-static void forward(int token, int reset_state, const float* side,
-                    const ParameterBeat* packed_params,
-                    ConvState& q_conv_state, ConvState& k_conv_state,
-                    ConvState& v_conv_state, RecurrentState& S,
-                    bool valid[kNumLayers][kNumHeads], uint32_t* next_token) {
-#pragma HLS ALLOCATION function instances = q8_linear limit = 1
+static void memory_process(const ParameterBeat* params, const float* side,
+                           uint32_t* next_token, hls::stream<MemCmd>& cmds,
+                           hls::stream<float>& embed, hls::stream<float>& rms_final,
+                           hls::stream<float>& rms_att, hls::stream<float>& rms_ffn,
+                           hls::stream<float>& beta_side, hls::stream<float>& conv_w,
+                           hls::stream<float>& o_norm,
+                           hls::stream<ParameterWord>& fill_words,
+                           hls::stream<ParameterWord>& axi_out,
+                           hls::stream<uint32_t>& lm_token) {
+#pragma HLS INLINE off
+  for (int i = 0; i < kMemCmdsPerToken; ++i) {
+#pragma HLS LOOP_TRIPCOUNT min = 35 max = 35
+    const MemCmd cmd = cmds.read();
+    const int layer = cmd.layer;
+    if (cmd.kind == kMemEmbed) {
+      load_embedding(embed, params, cmd.token);
+      stream_write_vec(rms_final, side + kSideRmsFinalOffset, kDim);
+    } else if (cmd.kind == kMemSide) {
+      stream_write_vec(rms_att, side + SideRmsAttOffset(layer), kDim);
+      stream_write_vec(rms_ffn, side + SideRmsFfnOffset(layer), kDim);
+      stream_write_vec(beta_side, side + SideAProjOffset(layer),
+                       kAProjSize + kBProjSize);
+      stream_write_vec(beta_side, side + SideAOffset(layer), 2 * kNumHeads);
+      stream_write_vec(conv_w, side + SideQConvOffset(layer),
+                       kQConvSize + kKConvSize + kVConvSize);
+      stream_write_vec(o_norm, side + SideONormOffset(layer), kHeadVDim);
+    } else if (cmd.kind == kMemFill) {
+      axi_words(fill_words, params, PackedQOffset(layer, 0), kMixerCacheWords);
+    } else if (cmd.kind == kMemW13) {
+      axi_words(axi_out, params, PackedW13Offset(layer), 2 * kPackedW13Words);
+    } else if (cmd.kind == kMemW2) {
+      axi_words(axi_out, params, PackedW2Offset(layer), kPackedW2Words);
+    } else if (cmd.kind == kMemLm) {
+      axi_words(axi_out, params, kPackedTokOffset, kPackedTokWords);
+    } else {
+      *next_token = lm_token.read();
+    }
+  }
+}
+
+static void scratch_process(hls::stream<ScratchCmd>& cmds,
+                            hls::stream<ParameterWord>& fill_words,
+                            hls::stream<ParameterWord>& sram_words) {
+#pragma HLS INLINE off
+  static ScratchMem scratch;
+#pragma HLS BIND_STORAGE variable = scratch type = ram_s2p impl = uram
+#pragma HLS ARRAY_PARTITION variable = scratch complete dim = 1
+
+  for (int i = 0; i < kScratchCmdsPerToken; ++i) {
+#pragma HLS LOOP_TRIPCOUNT min = 24 max = 24
+    const ScratchCmd cmd = cmds.read();
+    if (cmd.kind == kScratchFill) {
+      for (int it = 0; it < cmd.count; ++it) {
+#pragma HLS PIPELINE II = 1
+        scratch_write(scratch, cmd.addr + it, fill_words.read());
+      }
+    } else {
+      for (int it = 0; it < cmd.count; ++it) {
+#pragma HLS PIPELINE II = 1
+        sram_words.write(scratch_read(scratch, cmd.addr + it));
+      }
+    }
+  }
+}
+
+static void weight_router(hls::stream<RouteCmd>& cmds,
+                          hls::stream<ParameterWord>& axi_words,
+                          hls::stream<ParameterWord>& sram_words,
+                          hls::stream<ParameterWord>& weights) {
+#pragma HLS INLINE off
+  for (int i = 0; i < kRouteCmdsPerToken; ++i) {
+#pragma HLS LOOP_TRIPCOUNT min = 33 max = 33
+    const RouteCmd cmd = cmds.read();
+    if (cmd.src == kSrcSram) {
+      for (int it = 0; it < cmd.count; ++it) {
+#pragma HLS PIPELINE II = 1
+        weights.write(sram_words.read());
+      }
+    } else {
+      for (int it = 0; it < cmd.count; ++it) {
+#pragma HLS PIPELINE II = 1
+        weights.write(axi_words.read());
+      }
+    }
+  }
+}
+
+static void q8_process(hls::stream<Q8Cmd>& cmds, hls::stream<ParameterWord>& weights,
+                       hls::stream<ActPkt>& acts, hls::stream<float>& qkvg,
+                       hls::stream<float>& o_vec, hls::stream<float>& w13_vec,
+                       hls::stream<float>& w2_vec, hls::stream<uint32_t>& lm_token) {
+#pragma HLS INLINE off
+  float buf[2 * kHiddenDim];
+#pragma HLS ARRAY_PARTITION variable = buf cyclic factor = 2 dim = 1
+
+  for (int i = 0; i < kQ8CmdsPerToken; ++i) {
+#pragma HLS LOOP_TRIPCOUNT min = 33 max = 33
+    const Q8Cmd cmd = cmds.read();
+    const bool paired = cmd.kind == kQ8W13;
+    const bool argmax_mode = cmd.kind == kQ8Lm;
+    const int repeats = cmd.kind == kQ8Qkvg ? kNumHeads : 1;
+    const int count = q8_word_count(cmd.rows, cmd.groups, paired);
+    ActTable act;
+    load_act(acts, act, cmd.groups);
+    for (int r = 0; r < repeats; ++r) {
+#pragma HLS LOOP_TRIPCOUNT min = 1 max = 8
+      uint32_t token = 0;
+      q8_consume(buf, weights, count, cmd.rows, cmd.groups, act, paired,
+                 argmax_mode, &token);
+      if (argmax_mode) {
+        lm_token.write(token);
+      } else if (cmd.kind == kQ8Qkvg) {
+        stream_write_vec(qkvg, buf, cmd.rows);
+      } else if (cmd.kind == kQ8O) {
+        stream_write_vec(o_vec, buf, kDim);
+      } else if (cmd.kind == kQ8W13) {
+        stream_write_vec(w13_vec, buf, 2 * kHiddenDim);
+      } else {
+        stream_write_vec(w2_vec, buf, kDim);
+      }
+    }
+  }
+}
+
+static void beta_process(hls::stream<float>& beta_side, hls::stream<float>& attn_norm,
+                         hls::stream<float>& betas) {
+#pragma HLS INLINE off
+  for (int layer = 0; layer < kNumLayers; ++layer) {
+#pragma HLS LOOP_TRIPCOUNT min = 8 max = 8
+    float a_proj[kNumHeads][kDim];
+    float b_proj[kNumHeads][kDim];
+    float a_decay[kNumHeads];
+    float dt_bias[kNumHeads];
+    float norm[kDim];
+    for (int h = 0; h < kNumHeads; ++h) {
+      stream_read_vec(beta_side, a_proj[h], kDim);
+    }
+    for (int h = 0; h < kNumHeads; ++h) {
+      stream_read_vec(beta_side, b_proj[h], kDim);
+    }
+    for (int h = 0; h < kNumHeads; ++h) {
+#pragma HLS PIPELINE II = 1
+      a_decay[h] = beta_side.read();
+    }
+    for (int h = 0; h < kNumHeads; ++h) {
+#pragma HLS PIPELINE II = 1
+      dt_bias[h] = beta_side.read();
+    }
+    stream_read_vec(attn_norm, norm, kDim);
+    for (int h = 0; h < kNumHeads; ++h) {
+#pragma HLS LOOP_TRIPCOUNT min = 8 max = 8
+      float beta = 0.0f;
+      float decay = 0.0f;
+      fp8_beta_decay(norm, b_proj[h], a_proj[h], a_decay[h], dt_bias[h], beta,
+                     decay);
+      betas.write(beta);
+      betas.write(decay);
+    }
+  }
+}
+
+static void conv_process(hls::stream<int>& reset, hls::stream<float>& q_scale_s,
+                         hls::stream<float>& conv_w_s, hls::stream<float>& qkvg,
+                         hls::stream<float>& convd) {
+#pragma HLS INLINE off
+  static ConvHist hist;
+  static bool valid[kNumLayers][kNumHeads];
+#pragma HLS BIND_STORAGE variable = hist type = ram_2p impl = bram
+#pragma HLS ARRAY_PARTITION variable = valid complete dim = 0
+
+  const int reset_state = reset.read();
+  if (reset_state) {
+    for (int layer = 0; layer < kNumLayers; ++layer) {
+      for (int head = 0; head < kNumHeads; ++head) {
+#pragma HLS UNROLL
+        valid[layer][head] = false;
+      }
+    }
+  }
+  const float q_scale = q_scale_s.read();
+
+  for (int layer = 0; layer < kNumLayers; ++layer) {
+#pragma HLS LOOP_TRIPCOUNT min = 8 max = 8
+    float conv_w[kConvKinds][kKeyDim][kConvSize];
+    for (int kind = 0; kind < kConvKinds; ++kind) {
+      for (int c = 0; c < kKeyDim; ++c) {
+        for (int t = 0; t < kConvSize; ++t) {
+#pragma HLS PIPELINE II = 1
+          conv_w[kind][c][t] = conv_w_s.read();
+        }
+      }
+    }
+    for (int h = 0; h < kNumHeads; ++h) {
+#pragma HLS LOOP_TRIPCOUNT min = 8 max = 8
+      float q[kHeadKDim];
+      float k[kHeadKDim];
+      float v[kHeadVDim];
+      float g[kHeadVDim];
+      stream_read_vec(qkvg, q, kHeadKDim);
+      stream_read_vec(qkvg, k, kHeadKDim);
+      stream_read_vec(qkvg, v, kHeadVDim);
+      stream_read_vec(qkvg, g, kHeadVDim);
+      const int base = h * kHeadKDim;
+      const bool seen = valid[layer][h];
+      fp8_conv(q, hist, layer, 0, base, conv_w, kHeadKDim, seen);
+      fp8_conv(k, hist, layer, 1, base, conv_w, kHeadKDim, seen);
+      fp8_conv(v, hist, layer, 2, base, conv_w, kHeadVDim, seen);
+      fp8_l2scale(q, kHeadKDim, q_scale);
+      fp8_l2scale(k, kHeadKDim, 1.0f);
+      stream_write_vec(convd, q, kHeadKDim);
+      stream_write_vec(convd, k, kHeadKDim);
+      stream_write_vec(convd, v, kHeadVDim);
+      stream_write_vec(convd, g, kHeadVDim);
+      valid[layer][h] = true;
+    }
+  }
+}
+
+static void rec_process(hls::stream<int>& reset, hls::stream<float>& o_norm_s,
+                        hls::stream<float>& convd, hls::stream<float>& betas,
+                        hls::stream<float>& heads) {
+#pragma HLS INLINE off
+#pragma HLS ALLOCATION operation instances = fmul limit = 16
+#pragma HLS ALLOCATION operation instances = fadd limit = 16
+  static StateMem S;
+  static bool valid[kNumLayers][kNumHeads];
+#pragma HLS BIND_STORAGE variable = S type = ram_s2p impl = uram
+#pragma HLS ARRAY_PARTITION variable = S complete dim = 1
+#pragma HLS ARRAY_PARTITION variable = valid complete dim = 0
+
+  const int reset_state = reset.read();
   if (reset_state) {
     for (int layer = 0; layer < kNumLayers; ++layer) {
       for (int head = 0; head < kNumHeads; ++head) {
@@ -470,147 +1101,87 @@ static void forward(int token, int reset_state, const float* side,
     }
   }
 
-  float x[kDim];
-  float attn_norm[kDim];
-  float q[kHeadKDim];
-  float k[kHeadKDim];
-  float v[kHeadVDim];
-  float gate[kHeadVDim];
-  float head_out[kHeadVDim];
-#pragma HLS ARRAY_PARTITION variable = head_out complete dim = 1
-  float linear_out[kValueDim];
-  float ffn_norm[kDim];
-  float q8_out[kHiddenDim];
-  Q8ActivationBuffer act_q8;
-  Q8ScaleBuffer act_scales;
-  volatile uint32_t q8_result = 0;
-  volatile int q8_rows = 0;
-  volatile int q8_groups = 0;
-  volatile bool q8_paired = false;
-  volatile bool q8_argmax = false;
-
-  load_embedding(x, packed_params, token);
-
-  const float q_scale = 1.0f / sqrtf(static_cast<float>(kHeadKDim));
-
   for (int layer = 0; layer < kNumLayers; ++layer) {
-    const float* rms_att = side + SideRmsAttOffset(layer);
-    const float* rms_ffn = side + SideRmsFfnOffset(layer);
-    const float* a_proj = side + SideAProjOffset(layer);
-    const float* b_proj = side + SideBProjOffset(layer);
-    const float* q_conv = side + SideQConvOffset(layer);
-    const float* k_conv = side + SideKConvOffset(layer);
-    const float* v_conv = side + SideVConvOffset(layer);
-    const float* a_decay = side + SideAOffset(layer);
-    const float* dt_bias = side + SideDtBiasOffset(layer);
-    const float* o_norm = side + SideONormOffset(layer);
-
-    rmsnorm<kDim>(attn_norm, x, rms_att);
-    quantize<kDim>(act_q8, act_scales, attn_norm);
+#pragma HLS LOOP_TRIPCOUNT min = 8 max = 8
+    float o_norm[kHeadVDim];
+    stream_read_vec(o_norm_s, o_norm, kHeadVDim);
     for (int h = 0; h < kNumHeads; ++h) {
-      q8_rows = 2 * (kHeadKDim + kHeadVDim);
-      q8_groups = kDimGroups;
-      q8_paired = false;
-      q8_argmax = false;
-      q8_result = q8_linear(q8_out, packed_params, PackedQOffset(layer, h),
-                            q8_rows, q8_groups, act_q8, act_scales, q8_paired,
-                            q8_argmax);
-      for (int i = 0; i < kHeadKDim; ++i) {
-#pragma HLS PIPELINE II = 1
-        q[i] = q8_out[i];
-        k[i] = q8_out[kHeadKDim + i];
-      }
-      for (int i = 0; i < kHeadVDim; ++i) {
-#pragma HLS PIPELINE II = 1
-        v[i] = q8_out[2 * kHeadKDim + i];
-        gate[i] = q8_out[2 * kHeadKDim + kHeadVDim + i];
-      }
-
-      conv_step(q, q_conv_state[layer] + h * kHeadKDim,
-                q_conv + h * kHeadKDim * kConvSize, kHeadKDim,
-                valid[layer][h]);
-      conv_step(k, k_conv_state[layer] + h * kHeadKDim,
-                k_conv + h * kHeadKDim * kConvSize, kHeadKDim,
-                valid[layer][h]);
-      conv_step(v, v_conv_state[layer] + h * kHeadVDim,
-                v_conv + h * kHeadVDim * kConvSize, kHeadVDim,
-                valid[layer][h]);
-
-      float qacc[kAccStages];
-      float kacc[kAccStages];
-#pragma HLS ARRAY_PARTITION variable = qacc complete dim = 1
-#pragma HLS ARRAY_PARTITION variable = kacc complete dim = 1
-      clear_acc(qacc);
-      clear_acc(kacc);
-      for (int i = 0; i < kHeadKDim; ++i) {
-#pragma HLS PIPELINE II = 1
-#pragma HLS DEPENDENCE variable = qacc inter false
-#pragma HLS DEPENDENCE variable = kacc inter false
-        const int stage = i & (kAccStages - 1);
-        qacc[stage] = fadd(qacc[stage], q[i] * q[i]);
-        kacc[stage] = fadd(kacc[stage], k[i] * k[i]);
-      }
-      const float qn = 1.0f / sqrtf(reduce_acc(qacc) + 1e-6f);
-      const float kn = 1.0f / sqrtf(reduce_acc(kacc) + 1e-6f);
-      for (int i = 0; i < kHeadKDim; ++i) {
-#pragma HLS PIPELINE II = 1
-        q[i] = q[i] * qn * q_scale;
-        k[i] = k[i] * kn;
-      }
-      const float beta = sigmoidf(dot(attn_norm, b_proj + h * kDim, kDim));
-      const float decay = expf(
-          a_decay[h] *
-          softplusf(dot(attn_norm, a_proj + h * kDim, kDim) + dt_bias[h]));
-      recurrence_head(S[layer][h], q, k, v, beta, decay, valid[layer][h],
-                      head_out);
-      head_rmsnorm_gated(head_out, gate, o_norm);
-      for (int i = 0; i < kHeadVDim; ++i) {
-#pragma HLS PIPELINE II = 1
-        linear_out[h * kHeadVDim + i] = head_out[i];
-      }
+#pragma HLS LOOP_TRIPCOUNT min = 8 max = 8
+      float q[kHeadKDim];
+      float k[kHeadKDim];
+      float v[kHeadVDim];
+      float g[kHeadVDim];
+      float out[kHeadVDim];
+      stream_read_vec(convd, q, kHeadKDim);
+      stream_read_vec(convd, k, kHeadKDim);
+      stream_read_vec(convd, v, kHeadVDim);
+      stream_read_vec(convd, g, kHeadVDim);
+      const float beta = betas.read();
+      const float decay = betas.read();
+      fp8_recurrence(S, layer, h, q, k, v, beta, decay, valid[layer][h], out);
+      fp8_head_norm_gate(out, g, o_norm);
+      stream_write_vec(heads, out, kHeadVDim);
       valid[layer][h] = true;
     }
+  }
+}
 
-    quantize<kValueDim>(act_q8, act_scales, linear_out);
-    q8_rows = kDim;
-    q8_groups = kValueGroups;
-    q8_result = q8_linear(q8_out, packed_params, PackedOOffset(layer), q8_rows,
-                          q8_groups, act_q8, act_scales, q8_paired,
-                          q8_argmax);
-    for (int i = 0; i < kDim; ++i) {
-#pragma HLS PIPELINE II = 1
-      x[i] += q8_out[i];
-    }
+static void post_process(hls::stream<float>& embed, hls::stream<float>& rms_final,
+                         hls::stream<float>& rms_att, hls::stream<float>& rms_ffn,
+                         hls::stream<float>& rec_heads, hls::stream<float>& o_vec,
+                         hls::stream<float>& w13_vec, hls::stream<float>& w2_vec,
+                         hls::stream<float>& q_scale_s, hls::stream<float>& attn_norm,
+                         hls::stream<ActPkt>& acts) {
+#pragma HLS INLINE off
+#pragma HLS ALLOCATION operation instances = fmul limit = 16
+#pragma HLS ALLOCATION operation instances = fadd limit = 16
+  float x[kHiddenDim];
+  float tmp[kHiddenDim];
+  float fused[kHiddenDim];
+  float w1[kHiddenDim];
+  float w3[kHiddenDim];
+  float weight[kDim];
+  ActTable act;
 
-    rmsnorm<kDim>(ffn_norm, x, rms_ffn);
-    quantize<kDim>(act_q8, act_scales, ffn_norm);
-    q8_rows = kHiddenDim;
-    q8_groups = kDimGroups;
-    q8_paired = true;
-    q8_result = q8_linear(q8_out, packed_params, PackedW13Offset(layer),
-                          q8_rows, q8_groups, act_q8, act_scales, q8_paired,
-                          q8_argmax);
-    quantize<kHiddenDim>(act_q8, act_scales, q8_out);
-    q8_rows = kDim;
-    q8_groups = kHiddenGroups;
-    q8_paired = false;
-    q8_result = q8_linear(q8_out, packed_params, PackedW2Offset(layer),
-                          q8_rows, q8_groups, act_q8, act_scales, q8_paired,
-                          q8_argmax);
-    for (int i = 0; i < kDim; ++i) {
-#pragma HLS PIPELINE II = 1
-      x[i] += q8_out[i];
+  stream_read_vec(embed, x, kDim);
+  q_scale_s.write(sfu_rsqrt(static_cast<float>(kHeadKDim)));
+
+  for (int layer = 0; layer < kNumLayers; ++layer) {
+#pragma HLS LOOP_TRIPCOUNT min = 8 max = 8
+    stream_read_vec(rms_att, weight, kDim);
+    fp8_rmsnorm(tmp, x, weight, kDim);
+    fp8_quantize(act, tmp, kDim);
+    emit_act(acts, act, kDimGroups);
+    stream_write_vec(attn_norm, tmp, kDim);
+
+    for (int h = 0; h < kNumHeads; ++h) {
+      stream_read_vec(rec_heads, tmp + h * kHeadVDim, kHeadVDim);
     }
+    fp8_quantize(act, tmp, kValueDim);
+    emit_act(acts, act, kValueGroups);
+
+    stream_read_vec(o_vec, tmp, kDim);
+    fp8_residual(x, tmp, kDim);
+
+    stream_read_vec(rms_ffn, weight, kDim);
+    fp8_rmsnorm(tmp, x, weight, kDim);
+    fp8_quantize(act, tmp, kDim);
+    emit_act(acts, act, kDimGroups);
+
+    stream_read_vec(w13_vec, w1, kHiddenDim);
+    stream_read_vec(w13_vec, w3, kHiddenDim);
+    fp8_w13_fuse(fused, w1, w3);
+    fp8_quantize(act, fused, kHiddenDim);
+    emit_act(acts, act, kHiddenGroups);
+
+    stream_read_vec(w2_vec, tmp, kDim);
+    fp8_residual(x, tmp, kDim);
   }
 
-  rmsnorm<kDim>(attn_norm, x, side + kSideRmsFinalOffset);
-  quantize<kDim>(act_q8, act_scales, attn_norm);
-  q8_rows = kVocabSize;
-  q8_groups = kDimGroups;
-  q8_argmax = true;
-  q8_result = q8_linear(q8_out, packed_params, kPackedTokOffset, q8_rows,
-                        q8_groups, act_q8, act_scales, q8_paired, q8_argmax);
-  *next_token = q8_result;
+  stream_read_vec(rms_final, weight, kDim);
+  fp8_rmsnorm(tmp, x, weight, kDim);
+  fp8_quantize(act, tmp, kDim);
+  emit_act(acts, act, kDimGroups);
 }
 
 } // namespace
@@ -636,25 +1207,119 @@ void decode(int token, int reset_state,
 #pragma HLS INTERFACE s_axilite port = next_token bundle = control
 #pragma HLS INTERFACE s_axilite port = return bundle = control
 
-  static ConvState q_conv_state;
-  static ConvState k_conv_state;
-  static ConvState v_conv_state;
-  static RecurrentState S;
-  static bool valid[kNumLayers][kNumHeads];
-#pragma HLS BIND_STORAGE variable = q_conv_state type = ram_2p impl = bram
-#pragma HLS BIND_STORAGE variable = k_conv_state type = ram_2p impl = bram
-#pragma HLS BIND_STORAGE variable = v_conv_state type = ram_2p impl = bram
-#pragma HLS BIND_STORAGE variable = S type = ram_2p impl = uram
-  // The conv delay line updates all taps of a channel in one cycle, so the tap
-  // dimension has to be split at the declaration too, not just in conv_step.
-#pragma HLS ARRAY_PARTITION variable = q_conv_state complete dim = 3
-#pragma HLS ARRAY_PARTITION variable = k_conv_state complete dim = 3
-#pragma HLS ARRAY_PARTITION variable = v_conv_state complete dim = 3
-#pragma HLS ARRAY_PARTITION variable = S complete dim = 3
-#pragma HLS ARRAY_PARTITION variable = valid complete dim = 0
+  hls::stream<MemCmd> mem_cmds("mem_cmds");
+  hls::stream<ScratchCmd> scratch_cmds("scratch_cmds");
+  hls::stream<RouteCmd> route_cmds("route_cmds");
+  hls::stream<Q8Cmd> q8_cmds("q8_cmds");
+  hls::stream<int> conv_reset("conv_reset");
+  hls::stream<int> rec_reset("rec_reset");
+  hls::stream<float> embed("embed");
+  hls::stream<float> rms_final("rms_final");
+  hls::stream<float> rms_att("rms_att");
+  hls::stream<float> rms_ffn("rms_ffn");
+  hls::stream<float> beta_side("beta_side");
+  hls::stream<float> conv_w("conv_w");
+  hls::stream<float> o_norm("o_norm");
+  hls::stream<ParameterWord> fill_words("fill_words");
+  hls::stream<ParameterWord> axi_words_s("axi_words");
+  hls::stream<ParameterWord> sram_words("sram_words");
+  hls::stream<ParameterWord> weights("weights");
+  hls::stream<ActPkt> acts("acts");
+  hls::stream<float> q_scale("q_scale");
+  hls::stream<float> attn_norm("attn_norm");
+  hls::stream<float> qkvg("qkvg");
+  hls::stream<float> convd("convd");
+  hls::stream<float> betas("betas");
+  hls::stream<float> rec_heads("rec_heads");
+  hls::stream<float> o_vec("o_vec");
+  hls::stream<float> w13_vec("w13_vec");
+  hls::stream<float> w2_vec("w2_vec");
+  hls::stream<uint32_t> lm_token("lm_token");
+#pragma HLS STREAM variable = mem_cmds depth = 8
+#pragma HLS STREAM variable = scratch_cmds depth = 8
+#pragma HLS STREAM variable = route_cmds depth = 8
+#pragma HLS STREAM variable = q8_cmds depth = 8
+#pragma HLS STREAM variable = conv_reset depth = 2
+#pragma HLS STREAM variable = rec_reset depth = 2
+#pragma HLS STREAM variable = embed depth = 256
+#pragma HLS STREAM variable = rms_final depth = 256
+#pragma HLS STREAM variable = rms_att depth = 256
+#pragma HLS STREAM variable = rms_ffn depth = 256
+#pragma HLS STREAM variable = beta_side depth = 32
+#pragma HLS STREAM variable = conv_w depth = 32
+#pragma HLS STREAM variable = o_norm depth = 32
+#pragma HLS STREAM variable = fill_words depth = 2
+#pragma HLS STREAM variable = axi_words_s depth = 2
+#pragma HLS STREAM variable = sram_words depth = 2
+#pragma HLS STREAM variable = weights depth = 2
+#pragma HLS BIND_STORAGE variable = fill_words type = fifo impl = srl
+#pragma HLS BIND_STORAGE variable = axi_words_s type = fifo impl = srl
+#pragma HLS BIND_STORAGE variable = sram_words type = fifo impl = srl
+#pragma HLS BIND_STORAGE variable = weights type = fifo impl = srl
+#pragma HLS STREAM variable = acts depth = 24
+#pragma HLS STREAM variable = q_scale depth = 2
+#pragma HLS STREAM variable = attn_norm depth = 256
+#pragma HLS STREAM variable = qkvg depth = 256
+#pragma HLS STREAM variable = convd depth = 256
+#pragma HLS STREAM variable = betas depth = 16
+#pragma HLS STREAM variable = rec_heads depth = 64
+#pragma HLS STREAM variable = o_vec depth = 256
+#pragma HLS STREAM variable = w13_vec depth = 256
+#pragma HLS STREAM variable = w2_vec depth = 256
+#pragma HLS STREAM variable = lm_token depth = 2
 
-  forward(token, reset_state, side, packed_params, q_conv_state, k_conv_state,
-          v_conv_state, S, valid, next_token);
+#ifdef __SYNTHESIS__
+  // One call site per frozen process. Synthesis builds parallel RTL;
+  // C simulation uses the thread path below because g++ ignores DATAFLOW.
+#pragma HLS DATAFLOW disable_start_propagation
+  controller(token, reset_state, mem_cmds, scratch_cmds, route_cmds, q8_cmds,
+             conv_reset, rec_reset);
+  memory_process(packed_params, side, next_token, mem_cmds, embed, rms_final,
+                 rms_att, rms_ffn, beta_side, conv_w, o_norm, fill_words,
+                 axi_words_s, lm_token);
+  scratch_process(scratch_cmds, fill_words, sram_words);
+  weight_router(route_cmds, axi_words_s, sram_words, weights);
+  q8_process(q8_cmds, weights, acts, qkvg, o_vec, w13_vec, w2_vec, lm_token);
+  beta_process(beta_side, attn_norm, betas);
+  conv_process(conv_reset, q_scale, conv_w, qkvg, convd);
+  rec_process(rec_reset, o_norm, convd, betas, rec_heads);
+  post_process(embed, rms_final, rms_att, rms_ffn, rec_heads, o_vec, w13_vec,
+               w2_vec, q_scale, attn_norm, acts);
+#else
+  std::thread t_ctrl([&] {
+    controller(token, reset_state, mem_cmds, scratch_cmds, route_cmds, q8_cmds,
+               conv_reset, rec_reset);
+  });
+  std::thread t_mem([&] {
+    memory_process(packed_params, side, next_token, mem_cmds, embed, rms_final,
+                   rms_att, rms_ffn, beta_side, conv_w, o_norm, fill_words,
+                   axi_words_s, lm_token);
+  });
+  std::thread t_scratch(
+      [&] { scratch_process(scratch_cmds, fill_words, sram_words); });
+  std::thread t_router(
+      [&] { weight_router(route_cmds, axi_words_s, sram_words, weights); });
+  std::thread t_q8([&] {
+    q8_process(q8_cmds, weights, acts, qkvg, o_vec, w13_vec, w2_vec, lm_token);
+  });
+  std::thread t_beta([&] { beta_process(beta_side, attn_norm, betas); });
+  std::thread t_conv([&] { conv_process(conv_reset, q_scale, conv_w, qkvg, convd); });
+  std::thread t_rec(
+      [&] { rec_process(rec_reset, o_norm, convd, betas, rec_heads); });
+  std::thread t_post([&] {
+    post_process(embed, rms_final, rms_att, rms_ffn, rec_heads, o_vec, w13_vec,
+                 w2_vec, q_scale, attn_norm, acts);
+  });
+  t_ctrl.join();
+  t_mem.join();
+  t_scratch.join();
+  t_router.join();
+  t_q8.join();
+  t_beta.join();
+  t_conv.join();
+  t_rec.join();
+  t_post.join();
+#endif
 }
 
 } // extern "C"

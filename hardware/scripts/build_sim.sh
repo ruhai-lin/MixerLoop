@@ -14,7 +14,7 @@ fi
 
 mkdir -p "$OUT"
 
-COMMON_FLAGS=(-Wall -Wextra -Wno-unknown-pragmas -O2 -std=c++20
+COMMON_FLAGS=(-Wall -Wextra -Wno-unknown-pragmas -O2 -std=c++20 -pthread
               -I"$PROJECT/src" -I"$VITIS_INCLUDE")
 
 "$CXX" "${COMMON_FLAGS[@]}" -DBUILD_DECODE_KERNEL \
@@ -27,7 +27,7 @@ COMMON_FLAGS=(-Wall -Wextra -Wno-unknown-pragmas -O2 -std=c++20
   -c "$PROJECT/tools/kernel_sim.cpp" -o "$OUT/kernel_sim.o"
 
 "$CXX" "$OUT/decode_kernel.o" "$OUT/decode_cpu.o" "$OUT/weight.o" \
-  "$OUT/kernel_sim.o" -lm -o "$OUT/kernel_sim"
+  "$OUT/kernel_sim.o" -lm -pthread -o "$OUT/kernel_sim"
 
 echo "built: $OUT/kernel_sim"
 

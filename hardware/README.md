@@ -25,6 +25,23 @@ linear engine, and one persistent GDN recurrent state. The host uploads the
 packed weights once and launches one complete autoregressive decode step per
 token.
 
+## Structural HLS checkpoint
+
+`hardware/src/decode.cpp` (`BUILD_DECODE_KERNEL`) is a 9-process canonical
+DATAFLOW kernel, not the original sequential `forward()`. Process boundaries
+are frozen:
+
+```text
+controller  memory  scratch  weight_router
+q8          beta    conv     rec            post
+```
+
+Each compute process has one call site. Q8 consumes a unified `weight_stream`;
+AXI vs SRAM selection stays in `weight_router`. Recurrence state stays inside
+`rec_process`.
+
+Archived numbers and reports: `baselines/structural_hls/`.
+
 ## Validated baseline
 
 The imported M2 milestone was validated on KV260 with Vitis/Vivado 2025.2:
