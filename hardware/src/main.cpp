@@ -53,6 +53,7 @@ struct aligned_allocator {
 
 template <typename T>
 using AlignedVector = std::vector<T, aligned_allocator<T>>;
+
 #endif // USE_CPU_ONLY
 
 #ifdef USE_CPU_ONLY
@@ -255,7 +256,6 @@ int main(int argc, char** argv) {
     AlignedVector<float> side(side_src.size());
     std::memcpy(side.data(), side_src.data(), side_src.size() * sizeof(float));
     AlignedVector<std::uint32_t> next_aligned(1, 0);
-    AlignedVector<std::uint32_t> stats_aligned(8, 0);
 
     cl_int err = CL_SUCCESS;
     std::vector<cl::Platform> platforms;
@@ -313,15 +313,9 @@ int main(int argc, char** argv) {
     cl::Buffer buffer_next(context, CL_MEM_WRITE_ONLY | CL_MEM_USE_HOST_PTR,
                            sizeof(std::uint32_t), next_aligned.data(), &err);
     OCL_THROW_IF_ERROR(err, "buffer_next");
-    cl::Buffer buffer_stats(context, CL_MEM_WRITE_ONLY | CL_MEM_USE_HOST_PTR,
-                            stats_aligned.size() * sizeof(std::uint32_t),
-                            stats_aligned.data(), &err);
-    OCL_THROW_IF_ERROR(err, "buffer_stats");
-
     OCL_CHECK(err, err = kernel.setArg(3, buffer_params));
     OCL_CHECK(err, err = kernel.setArg(4, buffer_side));
     OCL_CHECK(err, err = kernel.setArg(5, buffer_next));
-    OCL_CHECK(err, err = kernel.setArg(6, buffer_stats));
     OCL_CHECK(err, err = queue.enqueueMigrateMemObjects(
                        {buffer_params, buffer_side}, 0));
     OCL_CHECK(err, err = queue.finish());
@@ -336,8 +330,7 @@ int main(int argc, char** argv) {
       gdn::CpuForward(state, weights, token, logits.data(), loop_count);
 #else
       const int fpga_next = gdn::Decode(token, pos == 0, loop_count, queue, kernel,
-                                        next_aligned.data(), buffer_next,
-                                        buffer_stats);
+                                        next_aligned.data(), buffer_next);
       if (fpga_next < 0) {
         throw std::runtime_error("decode kernel failed");
       }
@@ -365,9 +358,6 @@ int main(int argc, char** argv) {
     const double seconds = std::chrono::duration<double>(end - start).count();
     std::cout << "Time : " << seconds << "[s]\n"
               << "Speed: " << args.max_seq / seconds << "[tok/s]" << std::endl;
-#ifndef USE_CPU_ONLY
-    std::cout << "ring_max_occupancy: " << stats_aligned[0] << std::endl;
-#endif
     std::cout.flush();
     std::exit(EXIT_SUCCESS);
   } catch (const std::exception& e) {

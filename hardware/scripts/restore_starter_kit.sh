@@ -8,7 +8,8 @@ set -euo pipefail
 KV260=${KV260:-ubuntu@192.168.137.123}
 SUDO_PASSWORD=${SUDO_PASSWORD:-}
 if [[ -n "$SUDO_PASSWORD" ]]; then
-  ssh "$KV260" "echo '$SUDO_PASSWORD' | sudo -S -p '' bash -lc 'xmutil unloadapp >/dev/null 2>&1 || true; xmutil loadapp k26-starter-kits; xmutil listapps'"
+  printf '%s\n' "$SUDO_PASSWORD" |
+    ssh "$KV260" "sudo -S -p '' bash -lc 'xmutil unloadapp >/dev/null 2>&1 || true; xmutil loadapp k26-starter-kits; xmutil listapps'"
 else
   ssh "$KV260" "sudo xmutil unloadapp >/dev/null 2>&1 || true; \
     sudo xmutil loadapp k26-starter-kits; \

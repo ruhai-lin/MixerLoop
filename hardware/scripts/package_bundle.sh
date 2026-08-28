@@ -22,32 +22,25 @@ if [[ ! -f "$TOKENIZER_PATH" ]]; then
   echo "missing tokenizer.bin: $TOKENIZER_PATH" >&2
   exit 1
 fi
+for name in tinystories15m_t1_q8.bin tinystories15m_t4_q8.bin; do
+  if [[ ! -f "$MODEL_DIR/$name" ]]; then
+    echo "missing weight: $MODEL_DIR/$name" >&2
+    exit 1
+  fi
+done
 
+if [[ "$BUNDLE" != "$PROJECT/outputs/bundle" ]]; then
+  echo "refusing to clean unexpected bundle path: $BUNDLE" >&2
+  exit 1
+fi
+rm -rf -- "$BUNDLE"
 mkdir -p "$BUNDLE/model"
 
 cp -f "$PROJECT/outputs/host/gdn_host" "$BUNDLE/gdn_host"
 cp -f "$XCLBIN" "$BUNDLE/binary_container_1.bin"
 cp -f "$TOKENIZER_PATH" "$BUNDLE/model/tokenizer.bin"
-
-copy_weight() {
-  local src=$1
-  local dst=$2
-  if [[ -f "$src" ]]; then
-    cp -f "$src" "$dst"
-  fi
-}
-
-copy_weight "$MODEL_DIR/tinystories15m_t1_q8.bin" "$BUNDLE/model/tinystories15m_t1_q8.bin"
-copy_weight "$MODEL_DIR/tinystories15m_t4_q8.bin" "$BUNDLE/model/tinystories15m_t4_q8.bin"
-copy_weight "$MODEL_DIR/model.q8.bin" "$BUNDLE/model/model.q8.bin"
-
-if [[ ! -f "$BUNDLE/model/model.q8.bin" && -f "$BUNDLE/model/tinystories15m_t1_q8.bin" ]]; then
-  cp -f "$BUNDLE/model/tinystories15m_t1_q8.bin" "$BUNDLE/model/model.q8.bin"
-fi
-if [[ ! -f "$BUNDLE/model/tinystories15m_t1_q8.bin" && ! -f "$BUNDLE/model/model.q8.bin" ]]; then
-  echo "missing T=1 weights in $MODEL_DIR" >&2
-  exit 1
-fi
+cp -f "$MODEL_DIR/tinystories15m_t1_q8.bin" "$BUNDLE/model/"
+cp -f "$MODEL_DIR/tinystories15m_t4_q8.bin" "$BUNDLE/model/"
 
 if [[ -f "$PLATFORM_ROOT/sw/boot/pl.dtbo" ]]; then
   cp -f "$PLATFORM_ROOT/sw/boot/pl.dtbo" "$BUNDLE/pl.dtbo"

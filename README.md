@@ -106,10 +106,13 @@ LOOP_COUNT=4 STEPS=100000 SEQ_LEN=256 NGPU=2 \
 
 ## Hardware
 
-`hardware/` is the MixerLoop KV260 accelerator: one production bitstream, runtime
-`loop_count` selects T=1 or T=4. T=4 replays Mixer weights from SRAM and
-prefetches FFN into an on-chip ring. On KV260 at 150 MHz, T=1 is 116.4 token/s
-and T=4 is 88.4 token/s; both match the CPU Q8 oracle.
+`hardware/` is the MixerLoop KV260 accelerator: one production bitstream and
+one shared 64-MAC Q8 engine serve runtime T=1 through T=4. The first pass pins
+the current layer's Mixer weights in SRAM; later passes replay them while HP0
+prefetches FFN weights into a consume-and-replace ring. T=1 and T=4 both match
+the CPU Q8 oracle. At 150 MHz on KV260, the three-run medians are 119.549 tok/s
+for T=1 and 118.484 tok/s for T=4: T=4 retains 99.1% of T=1 throughput. See the
+hardware README for the routed resources, timing, and reproduction procedure.
 
 The canonical comparison weights are stored as:
 

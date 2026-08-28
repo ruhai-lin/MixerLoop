@@ -3,7 +3,7 @@
 ================================================================
 == Vitis HLS Report for 'decode'
 ================================================================
-* Date:           Tue Aug 18 09:55:15 2026
+* Date:           Mon Aug 24 22:59:50 2026
 
 * Version:        2025.2 (Build 6295257 on Nov 14 2025)
 * Project:        work
@@ -15,41 +15,41 @@
 ================================================================
 == Performance Estimates
 ================================================================
-+ Timing: 
-    * Summary: 
++ Timing:
+    * Summary:
     +--------+---------+----------+------------+
     |  Clock |  Target | Estimated| Uncertainty|
     +--------+---------+----------+------------+
     |ap_clk  |  6.67 ns|  5.172 ns|     1.80 ns|
     +--------+---------+----------+------------+
 
-+ Latency: 
-    * Summary: 
-    +---------+---------+----------+----------+-----+-----+----------+
-    |  Latency (cycles) |  Latency (absolute) |  Interval | Pipeline |
-    |   min   |   max   |    min   |    max   | min | max |   Type   |
-    +---------+---------+----------+----------+-----+-----+----------+
-    |        ?|        ?|         ?|         ?|    ?|    ?|  dataflow|
-    +---------+---------+----------+----------+-----+-----+----------+
++ Latency:
+    * Summary:
+    +------------+------------+------------+------------+-------+------------+----------+
+    |     Latency (cycles)    |    Latency (absolute)   |      Interval      | Pipeline |
+    |     min    |     max    |     min    |     max    |  min  |     max    |   Type   |
+    +------------+------------+------------+------------+-------+------------+----------+
+    |  1824948381|  4534707494|  12.167 sec|  30.233 sec|  45966|  4534707340|  dataflow|
+    +------------+------------+------------+------------+-------+------------+----------+
 
-    + Detail: 
-        * Instance: 
-        +------------------------------------------+---------------------------------------+---------+------------+-----------+------------+-------+------------+---------+
-        |                                          |                                       |   Latency (cycles)   |   Latency (absolute)   |      Interval      | Pipeline|
-        |                 Instance                 |                 Module                |   min   |     max    |    min    |     max    |  min  |     max    |   Type  |
-        +------------------------------------------+---------------------------------------+---------+------------+-----------+------------+-------+------------+---------+
-        |p_anonymous_namespace_controller_U0       |p_anonymous_namespace_controller       |       83|         155|   0.553 us|    1.033 us|     83|         155|       no|
-        |p_anonymous_namespace_memory_process_U0   |p_anonymous_namespace_memory_process   |      143|           ?|   0.953 us|           ?|    143|           ?|       no|
-        |p_anonymous_namespace_scratch_process_U0  |p_anonymous_namespace_scratch_process  |        ?|           ?|          ?|           ?|      ?|           ?|       no|
-        |p_anonymous_namespace_beta_process_U0     |p_anonymous_namespace_beta_process     |    73713|      306113|   0.491 ms|    2.041 ms|  73713|      306113|       no|
-        |p_anonymous_namespace_weight_router_U0    |p_anonymous_namespace_weight_router    |        ?|           ?|          ?|           ?|      ?|           ?|       no|
-        |p_anonymous_namespace_q8_process_U0       |p_anonymous_namespace_q8_process       |     2041|  5130375227|  13.607 us|  34.204 sec|   2041|  5130375227|       no|
-        |p_anonymous_namespace_conv_process_U0     |p_anonymous_namespace_conv_process     |    59762|      239076|   0.398 ms|    1.594 ms|  59762|      239076|       no|
-        |p_anonymous_namespace_rec_process_U0      |p_anonymous_namespace_rec_process      |    67186|      268772|   0.448 ms|    1.792 ms|  67186|      268772|       no|
-        |p_anonymous_namespace_post_process_U0     |p_anonymous_namespace_post_process     |    13151|      268001|  87.678 us|    1.787 ms|  13151|      268001|       no|
-        +------------------------------------------+---------------------------------------+---------+------------+-----------+------------+-------+------------+---------+
+    + Detail:
+        * Instance:
+        +-------------------------------------------+----------------------------------------+---------+------------+-----------+------------+-------+------------+---------+
+        |                                           |                                        |   Latency (cycles)   |   Latency (absolute)   |      Interval      | Pipeline|
+        |                  Instance                 |                 Module                 |   min   |     max    |    min    |     max    |  min  |     max    |   Type  |
+        +-------------------------------------------+----------------------------------------+---------+------------+-----------+------------+-------+------------+---------+
+        |p_anonymous_namespace_schedule_process_U0  |p_anonymous_namespace_schedule_process  |       83|         155|   0.553 us|    1.033 us|     83|         155|       no|
+        |p_anonymous_namespace_memory_process_U0    |p_anonymous_namespace_memory_process    |     2017|    16130185|  13.447 us|   0.108 sec|   2017|    16130185|       no|
+        |p_anonymous_namespace_scratch_process_U0   |p_anonymous_namespace_scratch_process   |      125|     2492803|   0.833 us|   16.620 ms|    125|     2492803|       no|
+        |p_anonymous_namespace_beta_process_U0      |p_anonymous_namespace_beta_process      |    45784|      315646|   0.305 ms|    2.104 ms|  45784|      315646|       no|
+        |p_anonymous_namespace_weight_router_U0     |p_anonymous_namespace_weight_router     |    39339|    11808411|   0.262 ms|   78.727 ms|  39339|    11808411|       no|
+        |p_anonymous_namespace_q8_process_U0        |p_anonymous_namespace_q8_process        |     5951|  4534707339|  39.675 us|  30.233 sec|   5951|  4534707339|       no|
+        |p_anonymous_namespace_conv_process_U0      |p_anonymous_namespace_conv_process      |    34949|      229617|   0.233 ms|    1.531 ms|  34949|      229617|       no|
+        |p_anonymous_namespace_rec_process_U0       |p_anonymous_namespace_rec_process       |    45965|      169689|   0.306 ms|    1.131 ms|  45965|      169689|       no|
+        |p_anonymous_namespace_post_process_U0      |p_anonymous_namespace_post_process      |    13414|      417709|  89.431 us|    2.785 ms|  13414|      417709|       no|
+        +-------------------------------------------+----------------------------------------+---------+------------+-----------+------------+-------+------------+---------+
 
-        * Loop: 
+        * Loop:
         N/A
 
 
@@ -57,152 +57,152 @@
 ================================================================
 == Utilization Estimates
 ================================================================
-* Summary: 
+* Summary:
 +-----------------+---------+------+--------+--------+-----+
 |       Name      | BRAM_18K|  DSP |   FF   |   LUT  | URAM|
 +-----------------+---------+------+--------+--------+-----+
 |DSP              |        -|     -|       -|       -|    -|
 |Expression       |        -|     -|       0|      30|    -|
-|FIFO             |       38|     -|    3976|    2128|    -|
-|Instance         |      236|   292|   74252|   89366|   56|
+|FIFO             |       50|     -|    3964|    2099|    -|
+|Instance         |      233|   477|  107083|  111130|   56|
 |Memory           |        -|     -|       -|       -|    -|
 |Multiplexer      |        -|     -|       0|      18|    -|
 |Register         |        -|     -|      12|       -|    -|
 +-----------------+---------+------+--------+--------+-----+
-|Total            |      274|   292|   78240|   91542|   56|
+|Total            |      283|   477|  111059|  113277|   56|
 +-----------------+---------+------+--------+--------+-----+
 |Available        |      288|  1248|  234240|  117120|   64|
 +-----------------+---------+------+--------+--------+-----+
-|Utilization (%)  |       95|    23|      33|      78|   87|
+|Utilization (%)  |       98|    38|      47|      96|   87|
 +-----------------+---------+------+--------+--------+-----+
 
-+ Detail: 
-    * Instance: 
-    +------------------------------------------+---------------------------------------+---------+-----+-------+-------+-----+
-    |                 Instance                 |                 Module                | BRAM_18K| DSP |   FF  |  LUT  | URAM|
-    +------------------------------------------+---------------------------------------+---------+-----+-------+-------+-----+
-    |control_s_axi_U                           |control_s_axi                          |        0|    0|    430|    744|    0|
-    |gmem_m_axi_U                              |gmem_m_axi                             |        8|    0|    871|    930|    0|
-    |p_anonymous_namespace_beta_process_U0     |p_anonymous_namespace_beta_process     |       15|   30|   5489|   7438|    0|
-    |p_anonymous_namespace_controller_U0       |p_anonymous_namespace_controller       |        0|    0|    138|   1093|    0|
-    |p_anonymous_namespace_conv_process_U0     |p_anonymous_namespace_conv_process     |      145|   35|   7059|  12995|    0|
-    |p_anonymous_namespace_memory_process_U0   |p_anonymous_namespace_memory_process   |        0|    4|   8433|   8467|    0|
-    |p_anonymous_namespace_post_process_U0     |p_anonymous_namespace_post_process     |       19|   45|  14299|  20635|    0|
-    |p_anonymous_namespace_q8_process_U0       |p_anonymous_namespace_q8_process       |       12|   57|   8251|   7228|    0|
-    |p_anonymous_namespace_rec_process_U0      |p_anonymous_namespace_rec_process      |        7|  121|  27555|  26177|   32|
-    |p_anonymous_namespace_scratch_process_U0  |p_anonymous_namespace_scratch_process  |        0|    0|    842|   2430|   24|
-    |p_anonymous_namespace_weight_router_U0    |p_anonymous_namespace_weight_router    |        0|    0|    109|    380|    0|
-    |params0_m_axi_U                           |params0_m_axi                          |       30|    0|    776|    849|    0|
-    +------------------------------------------+---------------------------------------+---------+-----+-------+-------+-----+
-    |Total                                     |                                       |      236|  292|  74252|  89366|   56|
-    +------------------------------------------+---------------------------------------+---------+-----+-------+-------+-----+
++ Detail:
+    * Instance:
+    +-------------------------------------------+----------------------------------------+---------+-----+-------+-------+-----+
+    |                  Instance                 |                 Module                 | BRAM_18K| DSP |   FF  |  LUT  | URAM|
+    +-------------------------------------------+----------------------------------------+---------+-----+-------+-------+-----+
+    |control_s_axi_U                            |control_s_axi                           |        0|    0|    360|    616|    0|
+    |gmem_m_axi_U                               |gmem_m_axi                              |        8|    0|    871|    930|    0|
+    |p_anonymous_namespace_beta_process_U0      |p_anonymous_namespace_beta_process      |       15|   30|   5489|   7449|    0|
+    |p_anonymous_namespace_conv_process_U0      |p_anonymous_namespace_conv_process      |      146|   35|   7059|  13027|    0|
+    |p_anonymous_namespace_memory_process_U0    |p_anonymous_namespace_memory_process    |        0|    4|   7577|   7882|    0|
+    |p_anonymous_namespace_post_process_U0      |p_anonymous_namespace_post_process      |       15|   36|  13923|  19020|    0|
+    |p_anonymous_namespace_q8_process_U0        |p_anonymous_namespace_q8_process        |       10|   91|  17062|  11176|    0|
+    |p_anonymous_namespace_rec_process_U0       |p_anonymous_namespace_rec_process       |        9|  281|  51073|  45516|   32|
+    |p_anonymous_namespace_schedule_process_U0  |p_anonymous_namespace_schedule_process  |        0|    0|     99|    876|    0|
+    |p_anonymous_namespace_scratch_process_U0   |p_anonymous_namespace_scratch_process   |        0|    0|   2710|   3373|   24|
+    |p_anonymous_namespace_weight_router_U0     |p_anonymous_namespace_weight_router     |        0|    0|     84|    416|    0|
+    |params0_m_axi_U                            |params0_m_axi                           |       30|    0|    776|    849|    0|
+    +-------------------------------------------+----------------------------------------+---------+-----+-------+-------+-----+
+    |Total                                      |                                        |      233|  477| 107083| 111130|   56|
+    +-------------------------------------------+----------------------------------------+---------+-----+-------+-------+-----+
 
-    * DSP: 
+    * DSP:
     N/A
 
-    * Memory: 
+    * Memory:
     N/A
 
-    * FIFO: 
+    * FIFO:
     +----------------+---------+-----+----+-----+------+-----+---------+
     |      Name      | BRAM_18K|  FF | LUT| URAM| Depth| Bits| Size:D*B|
     +----------------+---------+-----+----+-----+------+-----+---------+
     |acts_U          |       16|  152|   0|    -|    24|  288|     6912|
     |attn_norm_U     |        2|  159|   0|    -|   256|   32|     8192|
     |axi_words_s_U   |        0|   99|   0|    -|     2|  512|     1024|
-    |beta_cmds_U     |        0|   99|   0|    -|    16|   48|      768|
+    |beta_cmds_U     |        0|   99|   0|    -|    16|   32|      512|
     |beta_side_U     |        0|   99|   0|    -|    32|   32|     1024|
     |betas_U         |        0|   99|   0|    -|    16|   32|      512|
-    |conv_cmds_U     |        0|   99|   0|    -|    16|   48|      768|
+    |conv_cmds_U     |        0|   99|   0|    -|    16|   32|      512|
     |conv_reset_U    |        0|   99|   0|    -|     2|   32|       64|
     |conv_w_U        |        0|   99|   0|    -|    32|   32|     1024|
-    |convd_U         |        2|  159|   0|    -|   256|   32|     8192|
+    |convd_U         |        4|  157|   0|    -|   128|   64|     8192|
     |embed_U         |        2|  159|   0|    -|   256|   32|     8192|
+    |ffn_ready_U     |        0|   99|   0|    -|     2|    8|       16|
     |fill_words_U    |        0|   99|   0|    -|     2|  512|     1024|
     |lm_token_U      |        0|   99|   0|    -|     2|   32|       64|
-    |mem_cmds_U      |        0|   99|   0|    -|    16|  152|     2432|
+    |mem_cmds_U      |        0|   99|   0|    -|    16|   72|     1152|
     |o_norm_U        |        0|   99|   0|    -|    32|   32|     1024|
-    |o_vec_U         |        2|  159|   0|    -|   256|   32|     8192|
-    |occupancy_U     |        0|   99|   0|    -|     2|   32|       64|
-    |post_cmds_U     |        0|   99|   0|    -|    16|   56|      896|
-    |q8_cmds_U       |        0|   99|   0|    -|    16|   80|     1280|
+    |o_vec_U         |        4|  157|   0|    -|   128|   64|     8192|
+    |post_cmds_U     |        0|   99|   0|    -|    16|   40|      640|
+    |q8_cmds_U       |        0|   99|   0|    -|    16|   40|      640|
     |q_scale_U       |        0|   99|   0|    -|     2|   32|       64|
-    |qkvg_U          |        2|  159|   0|    -|   256|   32|     8192|
-    |rec_cmds_U      |        0|   99|   0|    -|    16|   48|      768|
-    |rec_heads_U     |        2|  155|   0|    -|    64|   32|     2048|
+    |qkvg_U          |        4|  157|   0|    -|   128|   64|     8192|
+    |rec_cmds_U      |        0|   99|   0|    -|    16|   32|      512|
+    |rec_heads_U     |        4|  153|   0|    -|    32|   64|     2048|
     |rec_reset_U     |        0|   99|   0|    -|     2|   32|       64|
     |rms_att_U       |        2|  159|   0|    -|   256|   32|     8192|
     |rms_ffn_U       |        2|  159|   0|    -|   256|   32|     8192|
     |rms_final_U     |        2|  159|   0|    -|   256|   32|     8192|
-    |route_cmds_U    |        0|   99|   0|    -|    16|   80|     1280|
-    |scratch_cmds_U  |        0|   99|   0|    -|    16|  152|     2432|
+    |route_cmds_U    |        0|   99|   0|    -|    16|   32|      512|
+    |scratch_cmds_U  |        0|   99|   0|    -|    16|   40|      640|
     |sram_words_U    |        0|   99|   0|    -|     2|  512|     1024|
-    |w13_vec_U       |        2|  159|   0|    -|   256|   32|     8192|
-    |w2_vec_U        |        2|  159|   0|    -|   256|   32|     8192|
+    |w13_vec_U       |        4|  157|   0|    -|   128|   64|     8192|
+    |w2_vec_U        |        4|  157|   0|    -|   128|   64|     8192|
     |weights_U       |        0|   99|   0|    -|     2|  512|     1024|
     +----------------+---------+-----+----+-----+------+-----+---------+
-    |Total           |       38| 3976|   0|    0|  2906| 3640|   109504|
+    |Total           |       50| 3964|   0|    0|  2234| 3464|   103952|
     +----------------+---------+-----+----+-----+------+-----+---------+
 
-    * Expression: 
-    +----------------------------------------------------------+----------+----+---+----+------------+------------+
-    |                       Variable Name                      | Operation| DSP| FF| LUT| Bitwidth P0| Bitwidth P1|
-    +----------------------------------------------------------+----------+----+---+----+------------+------------+
-    |ap_idle                                                   |       and|   0|  0|   2|           1|           1|
-    |ap_sync_continue                                          |       and|   0|  0|   2|           1|           1|
-    |ap_sync_done                                              |       and|   0|  0|   2|           1|           1|
-    |ap_sync_ready                                             |       and|   0|  0|   2|           1|           1|
-    |p_anonymous_namespace_controller_U0_ap_start              |       and|   0|  0|   2|           1|           1|
-    |p_anonymous_namespace_memory_process_U0_ap_start          |       and|   0|  0|   2|           1|           1|
-    |ap_sync_p_anonymous_namespace_controller_U0_ap_ready      |        or|   0|  0|   2|           1|           1|
-    |ap_sync_p_anonymous_namespace_memory_process_U0_ap_ready  |        or|   0|  0|   2|           1|           1|
-    |p_anonymous_namespace_beta_process_U0_ap_start            |        or|   0|  0|   2|           1|           1|
-    |p_anonymous_namespace_conv_process_U0_ap_start            |        or|   0|  0|   2|           1|           1|
-    |p_anonymous_namespace_post_process_U0_ap_start            |        or|   0|  0|   2|           1|           1|
-    |p_anonymous_namespace_q8_process_U0_ap_start              |        or|   0|  0|   2|           1|           1|
-    |p_anonymous_namespace_rec_process_U0_ap_start             |        or|   0|  0|   2|           1|           1|
-    |p_anonymous_namespace_scratch_process_U0_ap_start         |        or|   0|  0|   2|           1|           1|
-    |p_anonymous_namespace_weight_router_U0_ap_start           |        or|   0|  0|   2|           1|           1|
-    +----------------------------------------------------------+----------+----+---+----+------------+------------+
-    |Total                                                     |          |   0|  0|  30|          15|          15|
-    +----------------------------------------------------------+----------+----+---+----+------------+------------+
+    * Expression:
+    +------------------------------------------------------------+----------+----+---+----+------------+------------+
+    |                        Variable Name                       | Operation| DSP| FF| LUT| Bitwidth P0| Bitwidth P1|
+    +------------------------------------------------------------+----------+----+---+----+------------+------------+
+    |ap_idle                                                     |       and|   0|  0|   2|           1|           1|
+    |ap_sync_continue                                            |       and|   0|  0|   2|           1|           1|
+    |ap_sync_done                                                |       and|   0|  0|   2|           1|           1|
+    |ap_sync_ready                                               |       and|   0|  0|   2|           1|           1|
+    |p_anonymous_namespace_memory_process_U0_ap_start            |       and|   0|  0|   2|           1|           1|
+    |p_anonymous_namespace_schedule_process_U0_ap_start          |       and|   0|  0|   2|           1|           1|
+    |ap_sync_p_anonymous_namespace_memory_process_U0_ap_ready    |        or|   0|  0|   2|           1|           1|
+    |ap_sync_p_anonymous_namespace_schedule_process_U0_ap_ready  |        or|   0|  0|   2|           1|           1|
+    |p_anonymous_namespace_beta_process_U0_ap_start              |        or|   0|  0|   2|           1|           1|
+    |p_anonymous_namespace_conv_process_U0_ap_start              |        or|   0|  0|   2|           1|           1|
+    |p_anonymous_namespace_post_process_U0_ap_start              |        or|   0|  0|   2|           1|           1|
+    |p_anonymous_namespace_q8_process_U0_ap_start                |        or|   0|  0|   2|           1|           1|
+    |p_anonymous_namespace_rec_process_U0_ap_start               |        or|   0|  0|   2|           1|           1|
+    |p_anonymous_namespace_scratch_process_U0_ap_start           |        or|   0|  0|   2|           1|           1|
+    |p_anonymous_namespace_weight_router_U0_ap_start             |        or|   0|  0|   2|           1|           1|
+    +------------------------------------------------------------+----------+----+---+----+------------+------------+
+    |Total                                                       |          |   0|  0|  30|          15|          15|
+    +------------------------------------------------------------+----------+----+---+----+------------+------------+
 
-    * Multiplexer: 
-    +--------------------------------------------------------------+----+-----------+-----+-----------+
-    |                             Name                             | LUT| Input Size| Bits| Total Bits|
-    +--------------------------------------------------------------+----+-----------+-----+-----------+
-    |ap_sync_reg_p_anonymous_namespace_controller_U0_ap_ready      |   9|          2|    1|          2|
-    |ap_sync_reg_p_anonymous_namespace_memory_process_U0_ap_ready  |   9|          2|    1|          2|
-    +--------------------------------------------------------------+----+-----------+-----+-----------+
-    |Total                                                         |  18|          4|    2|          4|
-    +--------------------------------------------------------------+----+-----------+-----+-----------+
+    * Multiplexer:
+    +----------------------------------------------------------------+----+-----------+-----+-----------+
+    |                              Name                              | LUT| Input Size| Bits| Total Bits|
+    +----------------------------------------------------------------+----+-----------+-----+-----------+
+    |ap_sync_reg_p_anonymous_namespace_memory_process_U0_ap_ready    |   9|          2|    1|          2|
+    |ap_sync_reg_p_anonymous_namespace_schedule_process_U0_ap_ready  |   9|          2|    1|          2|
+    +----------------------------------------------------------------+----+-----------+-----+-----------+
+    |Total                                                           |  18|          4|    2|          4|
+    +----------------------------------------------------------------+----+-----------+-----+-----------+
 
-    * Register: 
-    +---------------------------------------------------------------+---+----+-----+-----------+
-    |                              Name                             | FF| LUT| Bits| Const Bits|
-    +---------------------------------------------------------------+---+----+-----+-----------+
-    |ap_rst_n_inv                                                   |  1|   0|    1|          0|
-    |ap_rst_reg_1                                                   |  1|   0|    1|          0|
-    |ap_rst_reg_2                                                   |  1|   0|    1|          0|
-    |ap_sync_reg_p_anonymous_namespace_beta_process_U0_ap_start     |  1|   0|    1|          0|
-    |ap_sync_reg_p_anonymous_namespace_controller_U0_ap_ready       |  1|   0|    1|          0|
-    |ap_sync_reg_p_anonymous_namespace_conv_process_U0_ap_start     |  1|   0|    1|          0|
-    |ap_sync_reg_p_anonymous_namespace_memory_process_U0_ap_ready   |  1|   0|    1|          0|
-    |ap_sync_reg_p_anonymous_namespace_post_process_U0_ap_start     |  1|   0|    1|          0|
-    |ap_sync_reg_p_anonymous_namespace_q8_process_U0_ap_start       |  1|   0|    1|          0|
-    |ap_sync_reg_p_anonymous_namespace_rec_process_U0_ap_start      |  1|   0|    1|          0|
-    |ap_sync_reg_p_anonymous_namespace_scratch_process_U0_ap_start  |  1|   0|    1|          0|
-    |ap_sync_reg_p_anonymous_namespace_weight_router_U0_ap_start    |  1|   0|    1|          0|
-    +---------------------------------------------------------------+---+----+-----+-----------+
-    |Total                                                          | 12|   0|   12|          0|
-    +---------------------------------------------------------------+---+----+-----+-----------+
+    * Register:
+    +----------------------------------------------------------------+---+----+-----+-----------+
+    |                              Name                              | FF| LUT| Bits| Const Bits|
+    +----------------------------------------------------------------+---+----+-----+-----------+
+    |ap_rst_n_inv                                                    |  1|   0|    1|          0|
+    |ap_rst_reg_1                                                    |  1|   0|    1|          0|
+    |ap_rst_reg_2                                                    |  1|   0|    1|          0|
+    |ap_sync_reg_p_anonymous_namespace_beta_process_U0_ap_start      |  1|   0|    1|          0|
+    |ap_sync_reg_p_anonymous_namespace_conv_process_U0_ap_start      |  1|   0|    1|          0|
+    |ap_sync_reg_p_anonymous_namespace_memory_process_U0_ap_ready    |  1|   0|    1|          0|
+    |ap_sync_reg_p_anonymous_namespace_post_process_U0_ap_start      |  1|   0|    1|          0|
+    |ap_sync_reg_p_anonymous_namespace_q8_process_U0_ap_start        |  1|   0|    1|          0|
+    |ap_sync_reg_p_anonymous_namespace_rec_process_U0_ap_start       |  1|   0|    1|          0|
+    |ap_sync_reg_p_anonymous_namespace_schedule_process_U0_ap_ready  |  1|   0|    1|          0|
+    |ap_sync_reg_p_anonymous_namespace_scratch_process_U0_ap_start   |  1|   0|    1|          0|
+    |ap_sync_reg_p_anonymous_namespace_weight_router_U0_ap_start     |  1|   0|    1|          0|
+    +----------------------------------------------------------------+---+----+-----+-----------+
+    |Total                                                           | 12|   0|   12|          0|
+    +----------------------------------------------------------------+---+----+-----+-----------+
 
 
 
 ================================================================
 == Interface
 ================================================================
-* Summary: 
+* Summary:
 +------------------------+-----+-----+---------------+--------------+--------------+
 |        RTL Ports       | Dir | Bits|    Protocol   | Source Object|    C Type    |
 +------------------------+-----+-----+---------------+--------------+--------------+
@@ -317,4 +317,3 @@
 |m_axi_params0_BID       |   in|    1|          m_axi|       params0|       pointer|
 |m_axi_params0_BUSER     |   in|    1|          m_axi|       params0|       pointer|
 +------------------------+-----+-----+---------------+--------------+--------------+
-

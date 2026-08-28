@@ -1,9 +1,9 @@
 # MixerLoop hardware: T=1 / T=4 on one bitstream
 
-One production `decode` kernel serves both TinyStories 15M checkpoints.
-Runtime `loop_count` (AXI-lite, also stored in the GDNe v2 header pad) selects
-T=1 or T=4. Compute engines stay ×1; T=4 uses extra loop-slot state and hides
-the extra Mixer passes behind FFN weight prefetch into an on-chip ring.
+One `decode` kernel serves both TinyStories 15M checkpoints. Runtime
+`loop_count` selects T=1 through T=4; the checkpoint header supplies the normal
+default. Every setting uses the same arithmetic hardware. T>1 replays cached
+Mixer weights while HP0 fetches the one non-recurrent FFN.
 
 ## Fixed profile
 
@@ -18,25 +18,38 @@ loop_count=1..4   T=4 enables Mixer/FFN overlap
 
 ## Process graph
 
-Nine persistent DATAFLOW processes, each synthesized once:
+Nine fixed DATAFLOW processes, each synthesized once:
 
 ```text
-controller  memory  scratch  weight_router
-q8          beta    conv     rec            post
+schedule  memory  scratch  weight_router
+q8        beta    conv     rec            post
 ```
 
-Rules: one Q8 call site; physical HP0 only in `memory`; Q8 consumes a unified
-`weight_stream`; AXI vs SRAM mux stays in `weight_router`; recurrent S stays
-inside `rec`. Command FIFOs are SRL (depth 16 on hardware, 256 in C-sim).
+`schedule` emits the fixed command sequence for this one model profile. It has
+no queue, arbitration, cache policy, or runtime work discovery. `memory` is the
+only HP0 owner. `weight_router` selects AXI or SRAM before the one shared Q8
+engine. Recurrent and convolution state remain inside their owning processes.
 
 T=1 (`loop_count=1`) is native GDN: loop0 Mixer from HP0, then FFN from HP0.
 T=4 (`loop_count=4`) per physical layer:
 
 ```text
-loop0: HP0 Mixer → Q8 + Mixer scratch[0,5759]
-loop1–3: scratch replay Mixer while HP0 prefetches FFN into scratch[5760,12287]
-then FFN: ring drain + 3840-word HP0 tail
+loop0: HP0 Mixer → Q8 and pinned scratch[0,5759]
+loop1–3: scratch replay while HP0 fills the FFN ring scratch[5760,12287]
+FFN: consume cached words and immediately reuse each released ring entry
 ```
+
+The Mixer region remains pinned until the last loop. The 6,528-word FFN region
+is a fixed ring with read pointer, write pointer, occupancy, and producer
+credit. There is no separate “cached drain” and “DDR tail” phase: after the
+last Mixer pass, consumption and the remaining HP0 transfer continue together.
+No same-address URAM read/write behavior is assumed.
+
+Q/K/V/G are produced one head at a time. Recurrence and post-processing consume
+those heads as a producer-consumer pipeline. Since `head_dim == group_size ==
+32`, each completed head is one full quantization group for O. The same Q8
+engine therefore accumulates O in 144-word head slices; there is no second O
+engine. Internal vector streams carry two FP32 values per 64-bit word.
 
 Semantics match the CPU oracle:
 
@@ -52,10 +65,12 @@ for layer:
 ```c
 void decode(int token, int reset_state, int loop_count,
             const ap_uint<128>* packed_params, const float* side,
-            uint32_t* next_token, uint32_t* stats);
+            uint32_t* next_token);
 ```
 
-`stats[0]` is the FFN ring occupancy high-water mark (0 for T=1, 6528 for T=4).
+The production ABI contains no trace or performance-counter buffer. The
+instrumented development build used to close the schedule equations was
+removed after validation.
 
 ## Header `loop_count`
 
@@ -70,44 +85,61 @@ Kernel-sim vs CPU Q8 oracle:
 
 | Check | Result |
 |---|---|
-| T=1 16/16 | pass, `ring_max=0` |
-| T=4 16/16 | pass, `ring_max=6528` |
+| T=1 16/16 | pass, exact argmax vs CPU Q8 oracle |
+| T=4 16/16 | pass, exact argmax vs CPU Q8 oracle |
 | T=1/T=4 reset and T cross-switch | pass |
 
 HLS csynth (`xck26-sfvc784-2LV-c`, 150 MHz):
 
 | Resource | Used | Available | % |
 |---|---:|---:|---:|
-| LUT | 91542 | 117120 | 78 |
-| FF | 78240 | 234240 | 33 |
-| DSP | 292 | 1248 | 23 |
-| BRAM18 | 274 | 288 | 95 |
+| LUT | 113277 | 117120 | 96 |
+| FF | 111059 | 234240 | 47 |
+| DSP | 477 | 1248 | 38 |
+| BRAM18 | 283 | 288 | 98 |
 | URAM | 56 | 64 | 87 |
 
 Each of `q8` / `beta` / `conv` / `rec` / `post` / `scratch` / `memory` /
-`router` / `controller` is a single instance. Recurrence is 32 URAM / 121 DSP;
-Mixer+FFN scratch is 24 URAM.
+`router` / `schedule` is a single instance. Recurrence is 32 URAM; Mixer+FFN
+scratch is 24 URAM. All scratch fill, replay, and consume loops achieve II=1.
 
 Routed implementation:
 
 | Item | Value |
 |---|---|
 | Clock | 150 MHz (`clk_out1` period 6.667 ns) |
-| WNS / TNS | **+0.340 ns / 0** |
-| Kernel LUT / REG | 57859 / 70688 |
-| Kernel BRAM tiles / URAM / DSP | 103 / 56 / 309 |
+| WNS / TNS | **+0.082 ns / 0** |
+| Kernel LUT / REG | 74489 / 98416 |
+| Kernel BRAM tiles / URAM / DSP | 104 / 56 / 493 |
 
 KV260, prompt `Once`, temp 0, same bitstream:
 
-| Run | Text vs CPU | tok/s | cycles/token | `ring_max` |
-|---|---|---:|---:|---:|
-| T=1 n=16 | match | 116.01 | — | 0 |
-| T=4 n=16 | match | 88.17 | — | 6528 |
-| T=1 n=128 | — | **116.40** | 1.289e6 | 0 |
-| T=4 n=128 | — | **88.45** | 1.696e6 | 6528 |
+| Run | Text vs CPU | tok/s |
+|---|---|---:|
+| T=1 n=16 | match | 116.323 |
+| T=4 n=16 | match | 117.124 |
+| T=1 n=128, three runs | match | 117.350, 119.549, 119.841 |
+| T=4 n=128, three runs | match | 118.467, 118.484, 118.846 |
 
-T=4 is 76% of T=1 throughput: the extra three Mixer passes are partly hidden
-behind FFN prefetch, but not fully. One bitstream, one HP0.
+The steady-state medians are 119.549 tok/s for T=1 and 118.484 tok/s for
+T=4. T=4 therefore retains **99.1%** of T=1 throughput: three extra Mixer
+passes are hidden by the single-HP memory window to within host timing noise.
+Both runs use the same bitstream and one physical HP0 port.
+
+## Why the extra loops are hidden
+
+HP0 supplies one 512-bit packed word every four cycles. Streaming the 10,368
+FFN words therefore exposes a 41,472-cycle memory window. An instrumented build
+measured one cached Mixer pass at 8,738 cycles, so three replays require 26,214
+cycles and satisfy the compute-side contract `3*C_M <= 4*C_F`.
+
+A 6,528-word ring has the stricter pre-consumer capacity bound `C_M <= 8,704`.
+The measured Mixer misses that bound by 34 cycles, so HP0 briefly sees a full
+ring before FFN starts. Consume-and-replace prevents this from becoming a
+serialized tail: once FFN starts, every consumed entry releases producer
+credit. The board result above is the final end-to-end check—the residual
+boundary effect is below 1% of token throughput. The release kernel removes the
+instrumentation used for these measurements.
 
 ## Source layout
 
@@ -172,7 +204,8 @@ not passwordless sudo; it is not stored in the repo.
 
 ```bash
 bash hardware/scripts/package_bundle.sh hardware/model
-RESTORE_STARTER=0 SUDO_PASSWORD=ubuntu bash hardware/scripts/deploy_kv260.sh
+RESTORE_STARTER=0 SUDO_PASSWORD='<board-password>' \
+  bash hardware/scripts/deploy_kv260.sh
 ```
 
 Board smoke:
@@ -190,5 +223,9 @@ cd ~/Projects/gdn_bundle
 Restore the quiet starter app when measurements are done:
 
 ```bash
-SUDO_PASSWORD=ubuntu bash hardware/scripts/restore_starter_kit.sh
+SUDO_PASSWORD='<board-password>' bash hardware/scripts/restore_starter_kit.sh
 ```
+
+Compact release reports are archived under
+`hardware/baselines/mixerloop_release/`. Generated build trees and deployment
+bundles remain under `hardware/outputs/` and are never release inputs.

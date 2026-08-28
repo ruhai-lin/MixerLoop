@@ -72,6 +72,8 @@ constexpr int PackedW2Offset(int layer) {
 }
 
 constexpr int kPackedTokOffset = 0;
+constexpr int kPackedTotalBeats =
+    PackedLayerBase(kNumLayers) * kBeatsPerWord;
 constexpr std::size_t kPackedTotalBytes =
     static_cast<std::size_t>(PackedLayerBase(kNumLayers)) * kPackedWordBytes;
 

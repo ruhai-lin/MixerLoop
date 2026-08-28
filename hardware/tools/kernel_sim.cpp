@@ -19,7 +19,7 @@
 
 extern "C" void decode(int token, int reset_state, int loop_count,
                        const ap_uint<128>* packed_params, const float* side,
-                       std::uint32_t* next_token, std::uint32_t* stats);
+                       std::uint32_t* next_token);
 
 namespace {
 
@@ -41,18 +41,15 @@ std::vector<ap_uint<128>> ToBeats(const std::vector<std::uint8_t>& bytes) {
 
 int RunCompare(const char* label, int loop_count, int steps, bool reset_first,
                const std::vector<ap_uint<128>>& params, const std::vector<float>& side,
-               const gdn::Weights& weights, std::uint32_t* ring_max_out) {
+               const gdn::Weights& weights) {
   gdn::RunState state;
   std::vector<float> logits(gdn::kVocabSize, 0.0f);
   int mismatches = 0;
-  std::uint32_t ring_max = 0;
   for (int step = 0; step < steps; ++step) {
     const int token = kDrive[step % kDriveCount];
     std::uint32_t fpga_next = 0;
-    std::uint32_t stats[8] = {};
     const int reset = (reset_first && step == 0) ? 1 : 0;
-    decode(token, reset, loop_count, params.data(), side.data(), &fpga_next,
-           stats);
+    decode(token, reset, loop_count, params.data(), side.data(), &fpga_next);
     if (reset) {
       state = gdn::RunState();
     }
@@ -60,21 +57,10 @@ int RunCompare(const char* label, int loop_count, int steps, bool reset_first,
     const int cpu_next = gdn::ArgmaxLogits(logits.data(), gdn::kVocabSize);
     const bool ok = static_cast<int>(fpga_next) == cpu_next;
     if (!ok) ++mismatches;
-    if (stats[0] > ring_max) {
-      ring_max = stats[0];
-    }
-    if (loop_count == gdn::kMaxLoopCount && stats[0] > 6528u) {
-      ++mismatches;
-      std::printf("%s step %2d  ring_max %u exceeds 6528\n", label, step,
-                  stats[0]);
-    }
-    std::printf("%s step %2d  token %5d  kernel %5u  cpu %5d  ring_max %u  %s\n",
-                label, step, token, fpga_next, cpu_next, stats[0],
+    std::printf("%s step %2d  token %5d  kernel %5u  cpu %5d  %s\n",
+                label, step, token, fpga_next, cpu_next,
                 ok ? "ok" : "MISMATCH");
     std::fflush(stdout);
-  }
-  if (ring_max_out) {
-    *ring_max_out = ring_max;
   }
   return mismatches;
 }
@@ -121,32 +107,19 @@ int main(int argc, char** argv) {
               loop_count);
   std::fflush(stdout);
 
-  std::uint32_t ring_max = 0;
-  int mismatches =
-      RunCompare("main", loop_count, steps, true, params, side, weights,
-                 &ring_max);
+  int mismatches = RunCompare("main", loop_count, steps, true, params, side,
+                              weights);
 
   if (run_gates) {
-    std::uint32_t gate_ring = 0;
-    mismatches += RunCompare("reset", loop_count, 4, true, params, side, weights,
-                             &gate_ring);
-    if (gate_ring > ring_max) {
-      ring_max = gate_ring;
-    }
+    mismatches +=
+        RunCompare("reset", loop_count, 4, true, params, side, weights);
     const int other = loop_count == gdn::kMaxLoopCount ? 1 : gdn::kMaxLoopCount;
-    mismatches += RunCompare("cross", other, 4, true, params, side, weights,
-                             &gate_ring);
-    if (gate_ring > ring_max) {
-      ring_max = gate_ring;
-    }
-    mismatches += RunCompare("back", loop_count, 4, true, params, side, weights,
-                             &gate_ring);
-    if (gate_ring > ring_max) {
-      ring_max = gate_ring;
-    }
+    mismatches += RunCompare("cross", other, 4, true, params, side, weights);
+    mismatches +=
+        RunCompare("back", loop_count, 4, true, params, side, weights);
   }
 
-  std::printf("%s (%d mismatch of %d) ring_max=%u\n",
-              mismatches ? "FAILED" : "PASSED", mismatches, steps, ring_max);
+  std::printf("%s (%d mismatch)\n", mismatches ? "FAILED" : "PASSED",
+              mismatches);
   return mismatches ? 1 : 0;
 }

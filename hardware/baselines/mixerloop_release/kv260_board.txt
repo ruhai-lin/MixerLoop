@@ -1,0 +1,7 @@
+prompt=Once  temp=0  clock=150 MHz
+T=1 n=16  text matches CPU  116.323 tok/s
+T=4 n=16  text matches CPU  117.124 tok/s
+T=1 n=128 117.350,119.549,119.841 tok/s  median=119.549
+T=4 n=128 118.467,118.484,118.846 tok/s  median=118.484
+T=4/T=1 steady-state throughput=99.1%
+routed WNS=+0.082 ns TNS=0
