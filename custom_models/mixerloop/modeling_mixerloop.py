@@ -35,6 +35,8 @@ class MixerLoopPreTrainedModel(GatedDeltaNetPreTrainedModel):
 
     def _init_weights(self, module: nn.Module):
         super()._init_weights(module)
+        if isinstance(module, MixerLoopModel):
+            nn.init.zeros_(module.residual_weight)
         if isinstance(module, GatedDeltaNet) and next(module.parameters()).device.type != 'meta':
             scale = math.sqrt(2 * self.config.num_hidden_layers * self.config.loop_count)
             nn.init.normal_(
@@ -58,6 +60,9 @@ class MixerLoopModel(MixerLoopPreTrainedModel):
             MixerLoopBlock(config, i) for i in range(config.num_hidden_layers)
         )
         self.norm = norm_cls(config.hidden_size, eps=config.norm_eps)
+        self.residual_weight = nn.Parameter(
+            torch.zeros(config.loop_count, config.hidden_size)
+        )
 
         self.gradient_checkpointing = False
         self.post_init()
@@ -102,11 +107,13 @@ class MixerLoopModel(MixerLoopPreTrainedModel):
                 hidden_states = self._gradient_checkpointing_func(
                     layer.__call__,
                     hidden_states,
+                    self.residual_weight,
                     attention_mask,
                 )
             else:
                 hidden_states = layer(
                     hidden_states,
+                    residual_weight=self.residual_weight,
                     attention_mask=attention_mask,
                     **kwargs,
                 )

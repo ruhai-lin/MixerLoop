@@ -7,19 +7,22 @@
 </div>
 
 MixerLoop repeats the Gated DeltaNet mixer while executing the FFN once. The
-repeated passes share weights, so recurrent compute can increase without adding
-model parameters.
+repeated passes share mixer weights, so recurrent compute only adds a small
+`T × hidden_size` residual gate instead of another mixer parameter set.
 
 ```text
 for physical layer i:
     for loop slot in range(T):
+        h_input = h
         h = h + GDN_i(RMSNorm_i(h))
+        h = h + residual_weight[loop_slot] * h_input
     h = h + FFN_i(FFNNorm_i(h))
 ```
 
-There are no loop-specific parameters or learned residuals. T=1 is exactly the
-native GDN block. During autoregressive decoding, every loop slot owns an
-independent recurrent state.
+The zero-initialized `residual_weight[T, dim]` is shared across every physical
+layer. The `configs/gdn_*.json` files instantiate FLA's native Gated DeltaNet
+with the same dimensions as the corresponding MixerLoop configs, providing the
+no-loop baselines for controlled training comparisons.
 
 ## Deployment profile
 
@@ -105,6 +108,9 @@ LOOP_COUNT=4 STEPS=100000 SEQ_LEN=256 NGPU=2 \
 ```
 
 ## Hardware
+
+The current `hardware/` tree is an earlier no-residual accelerator milestone;
+it is not yet the deployment target for the residual MixerLoop architecture.
 
 `hardware/` is the MixerLoop KV260 accelerator: one production bitstream and
 one shared 64-MAC Q8 engine serve runtime T=1 through T=4. The first pass pins

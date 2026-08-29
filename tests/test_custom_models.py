@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import math
+from pathlib import Path
 
 import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoModelForCausalLM
+from transformers import AutoConfig, AutoModelForCausalLM
 
 import custom_models  # noqa: F401
 from custom_models.mixerloop import MixerLoopConfig
 from custom_models.mixerloop.layers import MixerLoopBlock
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def tiny_config(loop_count: int = 4):
@@ -45,7 +49,8 @@ def test_meta_materialization_initializes_gdn(loop_count):
     model = initialize_like_flame(tiny_config(loop_count))
     base = model.model
 
-    assert not hasattr(base, "residual_weight")
+    assert base.residual_weight.shape == (loop_count, base.config.hidden_size)
+    torch.testing.assert_close(base.residual_weight, torch.zeros_like(base.residual_weight))
     assert all(torch.isfinite(parameter).all() for parameter in model.parameters())
     for layer in base.layers:
         mixer = layer.mixer
@@ -95,13 +100,55 @@ def test_mixerloop_repeats_only_the_mixer(loop_count):
     block.mixer = CountingMixer()
     block.ffn = CountingFFN()
 
-    output = block(torch.zeros(1, 3, config.hidden_size))
+    residual_weight = torch.zeros(loop_count, config.hidden_size)
+    output = block(torch.zeros(1, 3, config.hidden_size), residual_weight)
 
     assert block.mixer.calls == loop_count
     assert block.ffn.calls == 1
     torch.testing.assert_close(output, torch.full_like(output, loop_count + 1))
 
 
+def test_mixerloop_applies_shared_loop_residual():
+    config = tiny_config(loop_count=4)
+    block = MixerLoopBlock(config, layer_idx=0)
+    block.attn_norm = nn.Identity()
+    block.ffn_norm = nn.Identity()
+    block.mixer = CountingMixer()
+    block.ffn = CountingFFN()
+
+    residual_weight = torch.ones(config.loop_count, config.hidden_size)
+    output = block(torch.ones(1, 3, config.hidden_size), residual_weight)
+
+    torch.testing.assert_close(output, torch.full_like(output, 32.0))
+
+
 def test_invalid_loop_count_is_rejected():
     with pytest.raises(ValueError, match="loop_count"):
         tiny_config(0)
+
+
+@pytest.mark.parametrize("size", ["15m", "105m", "328m"])
+def test_gdn_baseline_configs_match_mixerloop_dimensions(size):
+    gdn_config = AutoConfig.from_pretrained(ROOT / "configs" / f"gdn_{size}.json")
+    mixerloop_config = AutoConfig.from_pretrained(ROOT / "configs" / f"mixerloop_{size}.json")
+
+    for field in (
+        "hidden_size",
+        "intermediate_size",
+        "num_hidden_layers",
+        "num_heads",
+        "head_dim",
+        "conv_size",
+        "vocab_size",
+    ):
+        assert getattr(gdn_config, field) == getattr(mixerloop_config, field)
+
+    with torch.device("meta"):
+        gdn = AutoModelForCausalLM.from_config(gdn_config)
+        mixerloop = AutoModelForCausalLM.from_config(mixerloop_config)
+    gdn_parameters = sum(parameter.numel() for parameter in gdn.parameters())
+    mixerloop_parameters = sum(parameter.numel() for parameter in mixerloop.parameters())
+
+    assert mixerloop_parameters == (
+        gdn_parameters + mixerloop_config.loop_count * mixerloop_config.hidden_size
+    )
