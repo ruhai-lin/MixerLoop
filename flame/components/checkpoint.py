@@ -7,10 +7,52 @@
 from dataclasses import dataclass, field
 from datetime import timedelta
 from io import BytesIO
+from pathlib import Path
+import re
 from typing import Any, Dict, List
 
 import torch
 from torch.distributed.checkpoint.stateful import Stateful
+from torchtitan.components.checkpoint import CheckpointManager as TitanCheckpointManager
+
+
+class CheckpointManager(TitanCheckpointManager):
+    """Keep selected scientific milestones alongside the rolling recovery window."""
+
+    def __init__(self, *args, job_config, **kwargs):
+        self.milestone_steps = frozenset(
+            int(step.strip())
+            for step in job_config.checkpoint.milestone_steps.split(",")
+            if step.strip()
+        )
+        if any(step <= 0 or step > job_config.training.steps for step in self.milestone_steps):
+            raise ValueError("Checkpoint milestones must lie within the training budget")
+        if self.milestone_steps and job_config.checkpoint.last_save_model_weights_only:
+            raise ValueError("Milestones require full resumable checkpoints")
+        super().__init__(*args, job_config=job_config, **kwargs)
+
+    def save(self, curr_step: int, force: bool = False):
+        return super().save(curr_step, force=force or curr_step in self.milestone_steps)
+
+    def _purge_stale_checkpoints(self):
+        if not self.milestone_steps:
+            return super()._purge_stale_checkpoints()
+        if (
+            self.keep_latest_k <= 0
+            or torch.distributed.get_rank() != 0
+            or not Path(self.folder).is_dir()
+            or (self.ft_manager and self.ft_manager.participating_rank() != 0)
+        ):
+            return
+        checkpoints = []
+        for path in Path(self.folder).iterdir():
+            match = re.fullmatch(r"step-(\d+)", path.name)
+            if match and path.is_dir():
+                checkpoints.append((int(match[1]), path))
+        checkpoints.sort()
+        for step, path in checkpoints[:-self.keep_latest_k]:
+            if step not in self.milestone_steps:
+                self.purge_queue.put(str(path))
 
 
 @dataclass

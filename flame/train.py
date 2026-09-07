@@ -16,7 +16,6 @@ import torch.nn.functional as F
 from fla.modules.fused_linear_cross_entropy import FusedLinearCrossEntropyLoss
 from fla.ops.utils import prepare_position_ids
 from torch.distributed.elastic.multiprocessing.errors import record
-from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.ft import FTParallelDims, init_ft_manager
 from torchtitan.components.loss import build_cross_entropy_loss
 from torchtitan.components.lr_scheduler import build_lr_schedulers
@@ -32,7 +31,7 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 import custom_models  # noqa: F401, registers MixerLoop model types
 from custom_models.training import build_reproduction_optimizers
-from flame.components.checkpoint import TrainState
+from flame.components.checkpoint import CheckpointManager, TrainState
 from flame.config_manager import JobConfig
 from flame.data import build_dataloader, build_dataset
 from flame.models.parallelize_fla import parallelize_fla
@@ -419,12 +418,14 @@ def main(job_config: JobConfig):
             optimizers.zero_grad()
 
             losses = []
+            step_tokens = 0
             # do gradient accumulation if enabled
             for _ in range(job_config.training.gradient_accumulation_steps):
                 # get batch
                 data_load_start = time.perf_counter()
                 batch = next(data_iterator)
                 input_ids, labels = batch["input_ids"], batch["labels"]
+                step_tokens += input_ids.numel()
 
                 # Update metrics processor state before forward/backward
                 metric_logger.ntokens_since_last_log += labels.numel()
@@ -549,6 +550,8 @@ def main(job_config: JobConfig):
             else:
                 optimizers.step()
             lr_schedulers.step()
+            # Count consumed inputs at every step, including non-log checkpoint steps.
+            train_state.token += step_tokens * dp_degree
 
             # log metrics - Use MetricsProcessor
             if metric_logger.should_log(train_state.step):
@@ -578,11 +581,6 @@ def main(job_config: JobConfig):
                 time_delta = (
                     time_now - metric_logger.time_last_log
                 )  # Use metric_logger's time
-                train_state.token += (
-                    metric_logger.ntokens_since_last_log  # Use tokens tracked by metric_logger
-                    * parallel_dims.world_size
-                    / parallel_dims.non_data_parallel_size
-                )
                 train_state.elapsed += timedelta(seconds=time_delta)
                 train_state.log_steps.append(train_state.step)
                 train_state.global_avg_losses.append(global_avg_loss)
@@ -600,6 +598,7 @@ def main(job_config: JobConfig):
                     global_avg_loss,
                     global_max_loss,
                     extra_metrics={
+                        "training/processed_tokens": train_state.token,
                         "optimizer/lr": last_lr,
                         "optimizer/grad_norm": grad_norm.item(),
                         "optimizer/skipped_step": train_state.skipped_step,

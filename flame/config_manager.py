@@ -735,6 +735,12 @@ class JobConfig:
             """,
         )
         self.parser.add_argument(
+            "--checkpoint.milestone_steps",
+            type=str,
+            default="",
+            help="Comma-separated steps to save and retain in addition to the latest k checkpoints.",
+        )
+        self.parser.add_argument(
             "--checkpoint.load_step",
             type=int,
             default=-1,
