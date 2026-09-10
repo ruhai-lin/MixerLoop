@@ -24,7 +24,7 @@ DATASET=${DATASET:-roneneldan/TinyStories}
 DATASET_SPLIT=${DATASET_SPLIT:-train}
 DATASET_REVISION=${DATASET_REVISION:-f54c09fd23315a6f9c86f9dc80f725de7d8f9c64}
 TOKENIZER=${TOKENIZER:-assets/tokenizer}
-OUTPUT=${OUTPUT:-outputs/tinystories15m_t${LOOP_COUNT}}
+OUTPUT=${OUTPUT:-outputs/tinystories13m_t${LOOP_COUNT}}
 NUM_WORKERS=${NUM_WORKERS:-0}
 CHECKPOINT_INTERVAL=${CHECKPOINT_INTERVAL:-2000}
 
@@ -46,7 +46,7 @@ fi
 train_args=(
   --job.config_file flame/models/fla.toml
   --job.dump_folder "$OUTPUT"
-  --model.config configs/mixerloop_15m.json
+  --model.config configs/mixerloop_13m.json
   --model.tokenizer_path "$TOKENIZER"
   --model.loop_count "$LOOP_COUNT"
   --optimizer.name AdamW

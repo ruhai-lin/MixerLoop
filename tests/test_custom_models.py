@@ -127,8 +127,13 @@ def test_invalid_loop_count_is_rejected():
         tiny_config(0)
 
 
-@pytest.mark.parametrize("size", ["15m", "105m", "328m"])
-def test_gdn_baseline_configs_match_mixerloop_dimensions(size):
+@pytest.mark.parametrize("size, expected_parameters", [
+    ("13m", 12_895_356),
+    ("100m", 100_444_194),
+    ("600m", 445_771_024),
+    ("1p3b", 1_578_945_120),
+])
+def test_gdn_baseline_configs_match_mixerloop_dimensions(size, expected_parameters):
     gdn_config = AutoConfig.from_pretrained(ROOT / "configs" / f"gdn_{size}.json")
     mixerloop_config = AutoConfig.from_pretrained(ROOT / "configs" / f"mixerloop_{size}.json")
 
@@ -138,6 +143,12 @@ def test_gdn_baseline_configs_match_mixerloop_dimensions(size):
         "num_hidden_layers",
         "num_heads",
         "head_dim",
+        "expand_v",
+        "max_position_embeddings",
+        "tie_word_embeddings",
+        "norm_eps",
+        "bos_token_id",
+        "eos_token_id",
         "conv_size",
         "vocab_size",
     ):
@@ -149,6 +160,7 @@ def test_gdn_baseline_configs_match_mixerloop_dimensions(size):
     gdn_parameters = sum(parameter.numel() for parameter in gdn.parameters())
     mixerloop_parameters = sum(parameter.numel() for parameter in mixerloop.parameters())
 
+    assert gdn_parameters == expected_parameters
     assert mixerloop_parameters == (
         gdn_parameters + mixerloop_config.loop_count * mixerloop_config.hidden_size
     )

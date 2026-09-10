@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import os
 import random
@@ -32,7 +33,12 @@ if RUN_ROOT not in sys.path:
 
 import custom_models  # noqa: F401
 
+# Task data follows nanochat; scoring metadata follows the official DCLM v2 fix.
 EVAL_BUNDLE_URL = "https://karpathy-public.s3.us-west-2.amazonaws.com/eval_bundle.zip"
+DCLM_REVISION = "361714bdd60bb9b7f4b2d8354cebbf0dec0c329e"
+DCLM_METADATA_URL = (
+    f"https://raw.githubusercontent.com/mlfoundations/dclm/{DCLM_REVISION}/eval/eval_meta_data.csv"
+)
 CORE_TO_HARNESS = {
     "hellaswag": "hellaswag",
     "arc_easy": "arc_easy",
@@ -387,6 +393,8 @@ def place_eval_bundle(zip_path, eval_bundle_dir):
 
 
 def ensure_eval_bundle(cache_dir: str):
+    # Keep the official download separate from earlier locally patched bundles.
+    cache_dir = os.path.join(cache_dir, "nanochat")
     eval_bundle_dir = os.path.join(cache_dir, "eval_bundle")
     if os.path.exists(eval_bundle_dir):
         return eval_bundle_dir
@@ -405,10 +413,22 @@ def ensure_eval_bundle(cache_dir: str):
     return eval_bundle_dir
 
 
+def ensure_core_metadata(eval_bundle_dir):
+    # Cache official metadata alongside, never overwrite the nanochat bundle.
+    path = os.path.join(os.path.dirname(eval_bundle_dir), f"dclm-{DCLM_REVISION}.csv")
+    if not os.path.exists(path):
+        response = requests.get(DCLM_METADATA_URL, timeout=60)
+        response.raise_for_status()
+        with open(path + ".part", "wb") as f:
+            f.write(response.content)
+        os.replace(path + ".part", path)
+    return path
+
+
 def evaluate_core(model, tokenizer, device, eval_bundle_dir, max_per_task=-1, eval_batch_size=8):
     config_path = os.path.join(eval_bundle_dir, "core.yaml")
     data_base_path = os.path.join(eval_bundle_dir, "eval_data")
-    eval_meta_data = os.path.join(eval_bundle_dir, "eval_meta_data.csv")
+    eval_meta_data = ensure_core_metadata(eval_bundle_dir)
 
     with open(config_path, "r", encoding="utf-8") as f:
         tasks = yaml.safe_load(f)["icl_tasks"]
@@ -448,7 +468,20 @@ def evaluate_core(model, tokenizer, device, eval_bundle_dir, max_per_task=-1, ev
         "results": results,
         "centered_results": centered_results,
         "core_metric": sum(centered_results.values()) / len(centered_results),
+        "Core_v2": sum(centered_results.values()) / len(centered_results),
+        "eval_version": "v2",
+        "eval_bundle": {
+            "url": EVAL_BUNDLE_URL,
+            "metadata_url": DCLM_METADATA_URL,
+            "core_yaml_sha256": file_sha256(config_path),
+            "metadata_sha256": file_sha256(eval_meta_data),
+        },
     }
+
+
+def file_sha256(path):
+    with open(path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
 
 
 def read_harness_csv(path: str):
@@ -564,7 +597,7 @@ def main():
         writer.writerow(["Task", "Accuracy", "Centered"])
         for label in core["results"]:
             writer.writerow([label, f"{core['results'][label]:.6f}", f"{core['centered_results'][label]:.6f}"])
-        writer.writerow(["CORE", "", f"{core['core_metric']:.6f}"])
+        writer.writerow(["Core_v2", "", f"{core['core_metric']:.6f}"])
     print(f"[core] metric={core['core_metric']:.4f}")
     print(f"[core] wrote {csv_path}")
 
