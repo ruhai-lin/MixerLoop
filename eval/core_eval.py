@@ -416,6 +416,13 @@ def evaluate_core(model, tokenizer, device, eval_bundle_dir, max_per_task=-1, ev
     with open(eval_meta_data, "r", encoding="utf-8") as f:
         for row in csv.DictReader(f):
             random_baselines[row["Eval Task"]] = float(row["Random baseline"])
+    # CORE v2 fix for the three outdated baselines in Karpathy's bundle.
+    # https://github.com/mlfoundations/dclm/pull/115
+    random_baselines.update({
+        "commonsense_qa": 40.3,
+        "agi_eval_lsat_ar": 25.0,
+        "bigbench_language_identification": 25.0,
+    })
 
     results, centered_results = {}, {}
     for task in tasks:
@@ -448,6 +455,8 @@ def evaluate_core(model, tokenizer, device, eval_bundle_dir, max_per_task=-1, ev
         "results": results,
         "centered_results": centered_results,
         "core_metric": sum(centered_results.values()) / len(centered_results),
+        "Core_v2": sum(centered_results.values()) / len(centered_results),
+        "eval_version": "v2",
     }
 
 
@@ -564,7 +573,7 @@ def main():
         writer.writerow(["Task", "Accuracy", "Centered"])
         for label in core["results"]:
             writer.writerow([label, f"{core['results'][label]:.6f}", f"{core['centered_results'][label]:.6f}"])
-        writer.writerow(["CORE", "", f"{core['core_metric']:.6f}"])
+        writer.writerow(["Core_v2", "", f"{core['core_metric']:.6f}"])
     print(f"[core] metric={core['core_metric']:.4f}")
     print(f"[core] wrote {csv_path}")
 

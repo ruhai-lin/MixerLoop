@@ -1,56 +1,43 @@
-<div align="center">
-
 # MixerLoop
 
-**Recurrent compute allocation for Gated Delta Networks, from pretraining to FPGA deployment.**
-
-</div>
-
-MixerLoop repeats the Gated DeltaNet mixer while executing the FFN once. The
-repeated passes share mixer weights, so recurrent compute only adds a small
-`T × hidden_size` residual gate instead of another mixer parameter set.
+MixerLoop repeats the Gated DeltaNet mixer T times and executes the FFN once.
+Mixer weights are shared across loops. A zero-initialized
+`residual_weight[T, dim]` is shared across all physical layers:
 
 ```text
 for physical layer i:
-    for loop slot in range(T):
+    for t in range(T):
         h_input = h
         h = h + GDN_i(RMSNorm_i(h))
-        h = h + residual_weight[loop_slot] * h_input
+        h = h + residual_weight[t] * h_input
     h = h + FFN_i(FFNNorm_i(h))
 ```
 
-The zero-initialized `residual_weight[T, dim]` is shared across every physical
-layer. The `configs/gdn_*.json` files instantiate FLA's native Gated DeltaNet
-with the same dimensions as the corresponding MixerLoop configs, providing the
-no-loop baselines for controlled training comparisons.
+## Canonical configurations
 
-## Deployment profile
+Each size has `configs/gdn_<size>.json` (FLA's native GDN) and
+`configs/mixerloop_<size>.json` (MixerLoop T=4). Both use tied embeddings,
+short convolution size 4, and `expand_v=2`.
 
-This repository fixes one software/hardware anchor before exploring ablations:
+| Size | Hidden | Layers | Heads | Key / value head dim | FFN | Vocabulary | Context |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 13m | 256 | 5 | 6 | 32 / 64 | 704 | 32,000 | 1,024 |
+| 100m | 768 | 9 | 9 | 64 / 128 | 2,112 | 32,000 | 1,024 |
+| 600m | 1,024 | 21 | 8 | 96 / 192 | 2,816 | 128,256 | 4,096 |
+| 1p6b | 2,048 | 22 | 8 | 192 / 384 | 5,632 | 128,256 | 4,096 |
 
-| Field | Value |
-|---|---:|
-| dataset | TinyStories |
-| tokenizer / vocabulary | Llama 2 / 32,000 |
-| context length | 256 |
-| hidden size | 256 |
-| physical layers | 8 |
-| heads / head dimension | 8 / 32 |
-| FFN intermediate size | 768 |
-| short convolution | 4 |
-| loop count | 1–4; release training uses T=4 |
-| deployment arithmetic | W8A8, group size 32 |
-| checkpoint format | GDNe v2 |
+13m/100m use the included Llama 2 tokenizer. 600m/1p6b retain the
+[LT2](https://github.com/chili-lab/LT2) Llama 3 tokenizer and 4096-token context
+recipe; supply that tokenizer explicitly.
 
-The HF config records the training loop count. The GDNe v2 header pad (file
-offset 48) stores the same T so the FPGA host can select T=1 or T=4 from one
-bitstream. Tensor bytes after the 256-byte header stay identical.
+Names identify geometry presets. Instantiated GDN parameter counts are
+12,895,356 / 100,444,194 / 445,771,024 / 1,578,945,120 respectively.
+MixerLoop adds exactly `4 * hidden_size` shared residual parameters.
 
 ## Environment
 
-Run inside the WSL Linux filesystem, for example
-`/home/<user>/Projects/MixerLoop`, rather than `/mnt/c`. The Python environment
-lives at the repository root.
+Run inside the WSL Linux filesystem, e.g. `~/Projects/MixerLoop`, rather than
+`/mnt/c`. Use one environment at the repository root.
 
 ```bash
 git clone https://github.com/ruhai-lin/MixerLoop.git
@@ -58,88 +45,90 @@ cd MixerLoop
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -U pip setuptools wheel ninja packaging
-# Install the PyTorch wheel appropriate for this machine first.
+# Select a PyTorch wheel appropriate for the GPU.
 python -m pip install torch
 python -m pip install -e '.[dev]'
 python -m pytest -q
 ```
 
-## Training and export
+## Training
 
-`train.sh` pins the TinyStories revision and uses the included Llama 2
-tokenizer. A successful run saves the distributed checkpoint, HF model,
-tokenizer, and GDNe v2 Q8 weight automatically.
-
-Local 1,000-step T=4 anchor:
+Use FLAME's native CLI to select the configuration, tokenizer and dataset.
+Example: 13m, FineWeb-Edu, global batch 128, 10,000,007,168 input tokens:
 
 ```bash
-LOOP_COUNT=4 STEPS=1000 SEQ_LEN=256 NGPU=1 \
-  MICRO_BATCH=1 GLOBAL_BATCH=8 CHECKPOINT_INTERVAL=1000 \
-  bash train.sh
+torchrun --nproc_per_node=1 -m flame.train \
+  --model.config configs/mixerloop_13m.json \
+  --model.tokenizer_path assets/tokenizer \
+  --job.dump_folder outputs/fineweb13m_t4 \
+  --training.dataset HuggingFaceFW/fineweb-edu \
+  --training.dataset_name sample-10BT \
+  --training.dataset_split train --training.streaming \
+  --training.seq_len 1024 --training.context_len 1024 \
+  --training.batch_size 8 --training.gradient_accumulation_steps 16 \
+  --training.steps 76294 --training.seed 1337 \
+  --training.data_parallel_replicate_degree 1 \
+  --training.data_parallel_shard_degree 1 \
+  --optimizer.name AdamW --optimizer.implementation fused \
+  --optimizer.lr 5e-4 --optimizer.beta1 0.9 --optimizer.beta2 0.95 \
+  --optimizer.weight_decay 0.1 \
+  --lr_scheduler.warmup_steps 1000 --lr_scheduler.decay_type cosine \
+  --checkpoint.enable_checkpoint --checkpoint.interval 2000
 ```
 
-The default output is `outputs/tinystories15m_t4`:
+For matched GDN, select `configs/gdn_13m.json` and a separate output directory.
+Keep global batch, seed, data order, schedule and token budget matched.
+Larger recipes require their matching tokenizer/context.
 
-```text
-outputs/tinystories15m_t4/
-├── checkpoint/step-1000/
-├── config.json
-├── model.safetensors
-├── tinystories15m_t4_q8.bin
-├── tokenizer.model
-├── tokenizer.bin
-└── source/
-```
+AdamW excludes parameters with fewer than two dimensions, `A_log`, and
+`dt_bias` from weight decay. Matrix parameters, including `residual_weight`,
+decay. Checkpoint save/load and rolling retention use the original TorchTitan
+`CheckpointManager`, without the later milestone extension.
 
-The full run uses the same command and configuration with `STEPS=100000`.
-Microbatch size may change for available memory, but comparisons should keep
-the effective global batch, seed, data revision, optimizer, and token budget
-fixed.
+`train.sh` remains a TinyStories convenience recipe using the 13m geometry.
+Use the native CLI for other datasets and formal experiments.
 
-The release recipe matches the existing 15M training budget: global batch 512,
-context 256 (131,072 tokens per optimizer step), AdamW at `5e-4`, 1,000 warmup
-steps, cosine decay to zero, and 100,000 optimizer steps. On the 2×3090 Ti
-machine it runs as:
+## CORE evaluation
 
 ```bash
-LOOP_COUNT=4 STEPS=100000 SEQ_LEN=256 NGPU=2 \
-  MICRO_BATCH=128 GLOBAL_BATCH=512 WARMUP_STEPS=1000 \
-  bash train.sh
+python eval/core_eval.py \
+  --model_path outputs/fineweb13m_t4 \
+  --tokenizer_path assets/tokenizer \
+  --out_dir outputs/fineweb13m_t4/core_eval
 ```
 
-## Hardware
+The evaluator expects an HF checkpoint and adapts
+[nanochat CORE](https://github.com/karpathy/nanochat/blob/master/nanochat/core_eval.py)
+to HF models and batched inference. Task definitions and examples come from the
+[eval_bundle used by nanochat](https://karpathy-public.s3.us-west-2.amazonaws.com/eval_bundle.zip).
+Baselines are read from that bundle, with the three
+[DCLM CORE v2 corrections](https://github.com/mlfoundations/dclm/pull/115)
+applied in memory: CommonsenseQA 40.3%, LSAT AR 25%, and language identification 25%.
+CORE v2 is the mean of `(accuracy - baseline) / (1 - baseline)`.
 
-The current `hardware/` tree is an earlier no-residual accelerator milestone;
-it is not yet the deployment target for the residual MixerLoop architecture.
+The bundle is cached under `core_bundle/` and is never modified by the evaluator.
+Results record `Core_v2` and `eval_version`; no separate metadata download is needed.
 
-`hardware/` is the MixerLoop KV260 accelerator: one production bitstream and
-one shared 64-MAC Q8 engine serve runtime T=1 through T=4. The first pass pins
-the current layer's Mixer weights in SRAM; later passes replay them while HP0
-prefetches FFN weights into a consume-and-replace ring. T=1 and T=4 both match
-the CPU Q8 oracle. At 150 MHz on KV260, the three-run medians are 119.549 tok/s
-for T=1 and 118.484 tok/s for T=4: T=4 retains 99.1% of T=1 throughput. See the
-hardware README for the routed resources, timing, and reproduction procedure.
+## Hardware and local artifacts
 
-The canonical comparison weights are stored as:
+`hardware/` preserves the earlier KV260 milestone; it does not yet implement
+the residual MixerLoop architecture or these canonical geometries.
+See `hardware/README.md` for the milestone implementation and toolchain.
+Training does not automatically produce compatible Q8 hardware weights.
 
-```text
-hardware/model/tinystories15m_t1_q8.bin
-hardware/model/tinystories15m_t4_q8.bin
-```
+Checkpoints, weights and logs stay local and are excluded from Git.
+Historical outputs are kept under `outputs/legacy/` on each machine.
+Active isolated runs retain their existing source and output paths.
 
-See `hardware/README.md` for the accelerator and toolchain details.
-
-## Repository layout
+## Layout
 
 ```text
 assets/tokenizer/        Llama 2 tokenizer
-configs/                 fixed MixerLoop deployment profile
+configs/                 matched canonical configurations
 custom_models/mixerloop/ Transformers model implementation
-flame/                   FLAME/TorchTitan training and final export
-eval/                    language-model evaluation entry points
-hardware/                golden GDN accelerator and deployment weights
-tests/                   model and export contracts
+flame/                   training and checkpoint conversion
+eval/                    CORE and lm-eval entry points
+hardware/                earlier accelerator milestone
+tests/                   model, data, optimizer and export contracts
+outputs/legacy/          local historical artifacts (ignored)
 ```
-
-Earlier paper experiments and implementation milestones live outside the
-release tree under the locally ignored `references/` directory.
