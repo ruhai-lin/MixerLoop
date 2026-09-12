@@ -53,27 +53,35 @@ python -m pytest -q
 
 ## Training
 
-Use FLAME's native CLI to select the configuration, tokenizer and dataset.
+Use `train.sh` to pass FLAME's native CLI arguments without a separate recipe wrapper.
+The script runs training, then converts the final DCP to standard HF files.
 Example: 13m, FineWeb-Edu, global batch 128, 10,000,007,168 input tokens:
 
 ```bash
-torchrun --nproc_per_node=1 -m flame.train \
+WANDB_PROJECT=mixerloop WANDB_NAME=fineweb13m_mixerloop_10b_s1337 NGPU=1 bash train.sh \
+  --job.config_file flame/models/fla.toml \
   --model.config configs/mixerloop_13m.json \
   --model.tokenizer_path assets/tokenizer \
-  --job.dump_folder outputs/fineweb13m_t4 \
+  --job.dump_folder outputs/mixerloop-13m/fineweb-edu-10B-s1337 \
   --training.dataset HuggingFaceFW/fineweb-edu \
   --training.dataset_name sample-10BT \
   --training.dataset_split train --training.streaming \
+  --training.data_dir '' --training.num_workers 0 \
   --training.seq_len 1024 --training.context_len 1024 \
   --training.batch_size 8 --training.gradient_accumulation_steps 16 \
-  --training.steps 76294 --training.seed 1337 \
+  --training.steps 76294 --training.seed 1337 --training.max_norm 1.0 \
   --training.data_parallel_replicate_degree 1 \
   --training.data_parallel_shard_degree 1 \
+  --training.tensor_parallel_degree 1 --training.disable_loss_parallel \
+  --training.mixed_precision_param bfloat16 --training.mixed_precision_reduce float32 \
+  --activation_checkpoint.mode none \
   --optimizer.name AdamW --optimizer.implementation fused \
-  --optimizer.lr 5e-4 --optimizer.beta1 0.9 --optimizer.beta2 0.95 \
+  --optimizer.lr 5e-4 --optimizer.eps 1e-8 --optimizer.beta1 0.9 --optimizer.beta2 0.95 \
   --optimizer.weight_decay 0.1 \
-  --lr_scheduler.warmup_steps 1000 --lr_scheduler.decay_type cosine \
-  --checkpoint.enable_checkpoint --checkpoint.interval 2000
+  --lr_scheduler.warmup_steps 1000 --lr_scheduler.decay_type cosine --lr_scheduler.lr_min 0.0 \
+  --checkpoint.enable_checkpoint --checkpoint.interval 2000 \
+  --checkpoint.keep_latest_k 2 --checkpoint.load_step -1 \
+  --metrics.log_freq 20 --metrics.enable_wandb
 ```
 
 For matched GDN, select `configs/gdn_13m.json` and a separate output directory.
@@ -85,16 +93,38 @@ AdamW excludes parameters with fewer than two dimensions, `A_log`, and
 decay. Checkpoint save/load and rolling retention use the original TorchTitan
 `CheckpointManager`, without the later milestone extension.
 
-`train.sh` remains a TinyStories convenience recipe using the 13m geometry.
-Use the native CLI for other datasets and formal experiments.
+Specify dataset revision only for the selected dataset. Local parquet uses
+`--training.dataset parquet --training.data_files 'path/*.parquet'`;
+pretokenized ClimbMix uses `--training.dataset climbmix --training.data_dir path`.
+Set microbatch and gradient accumulation explicitly, keeping the intended global batch.
+For parquet, also pass `--training.data_dir ''` to clear the ClimbMix directory default.
+Before a formal launch, record the full command, resolved model config, dataset,
+seed, learning rate, batch accounting, steps, processed tokens, GPU count, git SHA
+and environment. A W&B run name does not set any training parameters.
+When resuming W&B logging, provide the existing `WANDB_RUN_ID` and
+`WANDB_RESUME=must` explicitly; the launcher preserves these environment values.
+
+To export an already completed run without training again:
+
+```bash
+python -m flame.utils.convert_dcp_to_hf \
+  --path outputs/mixerloop-13m/fineweb-edu-10B-s1337 --step 76294 \
+  --config outputs/mixerloop-13m/fineweb-edu-10B-s1337/config.json \
+  --tokenizer assets/tokenizer
+```
+
+Use the run's resolved config, not a subsequently edited geometry preset.
+This exports HF only; no Q8 or hardware tokenizer is produced.
+DCP and logs remain local in the run directory. Upload only HF model/tokenizer
+files and `eval/core_eval.csv`, never the whole training directory.
 
 ## CORE evaluation
 
 ```bash
 python eval/core_eval.py \
-  --model_path outputs/fineweb13m_t4 \
-  --tokenizer_path assets/tokenizer \
-  --out_dir outputs/fineweb13m_t4/core_eval
+  --model_path outputs/mixerloop-13m/fineweb-edu-10B-s1337 \
+  --out_dir outputs/mixerloop-13m/fineweb-edu-10B-s1337/eval \
+  --max_per_task -1 --no_head_stats
 ```
 
 The evaluator expects an HF checkpoint and adapts
