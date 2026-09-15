@@ -44,8 +44,8 @@ struct Weights {
   QuantizedTensor tok_emb;          // [vocab, dim] (shared classifier / wcls)
   std::vector<LayerWeights> layers; // [n_layers]
   std::vector<float> rms_final;     // [dim]
-  // Header pad. 0 means legacy/unspecified; otherwise a runtime T in 1..4.
-  int loop_count = 0;
+  std::vector<float> residual; // [max_loop_count, dim]; zero for GDN/unused slots
+  int loop_count = 1;
 };
 
 void LoadWeights(Weights& weights, const std::string& path);

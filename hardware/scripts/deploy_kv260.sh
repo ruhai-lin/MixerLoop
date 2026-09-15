@@ -5,8 +5,8 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 PROJECT=$(cd -- "$SCRIPT_DIR/.." && pwd)
 BUNDLE="$PROJECT/outputs/bundle"
 KV260=${KV260:-ubuntu@192.168.137.123}
-REMOTE=${REMOTE:-/home/ubuntu/Projects/gdn_bundle}
-APP=${APP:-gdn}
+REMOTE=${REMOTE:-/home/ubuntu/Projects/mixerloop13m_bundle}
+APP=${APP:-mixerloop13m}
 
 case "$REMOTE" in
   /home/*/Projects/*_bundle) ;;
@@ -44,14 +44,14 @@ remote_sudo() {
 remote_sudo "mkdir -p /lib/firmware/xilinx/$APP && \
   cp $REMOTE/binary_container_1.bin $REMOTE/pl.dtbo $REMOTE/shell.json \
      /lib/firmware/xilinx/$APP/ && \
-  xmutil unloadapp >/dev/null 2>&1 || true; \
+  { xmutil unloadapp >/dev/null 2>&1 || true; } && \
   xmutil loadapp $APP"
 
 echo "deployed to $KV260:$REMOTE (app=$APP)"
 
 # After board testing, switch back to the quiet starter app so the fan settles.
 # Call with RESTORE_STARTER=1 (default) after a smoke run, or RESTORE_STARTER=0
-# to leave the gdn bitstream loaded.
+# to leave the MixerLoop bitstream loaded.
 RESTORE_STARTER=${RESTORE_STARTER:-1}
 if [[ "$RESTORE_STARTER" == "1" ]]; then
   remote_sudo "xmutil unloadapp >/dev/null 2>&1 || true; xmutil loadapp k26-starter-kits"

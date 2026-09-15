@@ -1,10 +1,10 @@
-// Gated DeltaNet 15M single-kernel decoder.
+// Canonical Gated DeltaNet / MixerLoop 13m single-kernel decoder.
 //
 // Two builds share this file:
 //   * BUILD_DECODE_KERNEL  -> structural HLS kernel. One canonical DATAFLOW
 //     region; each physical module is a single long-running process.
 //   * otherwise            -> CPU Q8 reference and FPGA host glue. That half
-//     is the numerical oracle and must not change.
+//     is the numerical oracle for the same model semantics.
 //
 // Frozen process graph (do not add compute call sites or split these):
 //   schedule_process, memory_process, scratch_process, weight_router,
@@ -36,26 +36,24 @@ constexpr int kAccStages = 8;
 constexpr int kHeadGroups = kHeadVDim / kVecLanes;
 constexpr int kSWords =
     kMaxLoopCount * kNumLayers * kNumHeads * kHeadKDim * kHeadGroups;
-constexpr int kConvKinds = 3;
-constexpr int kScratchDepth = 12288;
+constexpr int kConvChannels = 2 * kKeyDim + kValueDim;
+constexpr int kScratchDepth = 16384;
 constexpr int kScratchBanks = 8;
 constexpr int kMixerCacheBase = 0;
-// Frozen Mixer Q8 cache: scratch[0, 5759], 8×64-bit banks, 24 URAM.
-// loop0 writes all 5760 words; loop1–3 read 512 bit/cycle from the same window.
-constexpr int kMixerCacheWords = kPackedQKVGWords + kPackedProjWords;
+// loop0 streams and fills; subsequent passes replay the same pinned region.
+constexpr int kMixerCacheWords = kPackedQKVGWords + kPackedOWords;
 constexpr int kFfnRingBase = kMixerCacheWords;
-constexpr int kFfnRingWords = 6528;
+constexpr int kFfnRingWords = kScratchDepth - kMixerCacheWords;
 constexpr int kFfnPackedWords = 2 * kPackedW13Words + kPackedW2Words;
-constexpr int kPackedOHeadWords = PackedMatrixWords(kDim, 1);
+constexpr int kPackedOGroupWords = PackedMatrixWords(kDim, 1);
 constexpr int kQkvgRows = 2 * (kHeadKDim + kHeadVDim);
-static_assert(kMixerCacheWords == 5760, "Mixer cache must be 5760 packed words");
+static_assert(kMixerCacheWords == 6912, "13m Mixer packing");
 static_assert(kScratchBanks == 8, "Mixer scratch is 8×64-bit");
-static_assert(kMixerCacheBase == 0, "Mixer cache occupies scratch[0, 5759]");
+static_assert(kMixerCacheBase == 0, "Mixer cache starts at zero");
 static_assert(kFfnRingBase + kFfnRingWords == kScratchDepth,
-              "FFN ring must occupy scratch[5760, 12287]");
-static_assert(kPackedOHeadWords == 144, "one O input-head group is 144 words");
-static_assert(2 * kPackedW13Words == 6912, "paired W1/W3 must be 6912 words");
-static_assert(kPackedW2Words == 3456, "W2 must be 3456 words");
+              "FFN ring occupies the remaining scratch");
+static_assert(kPackedOGroupWords == 144, "one O input group is 144 words");
+static_assert(kFfnPackedWords == 9504, "13m FFN packing");
 
 using ParameterBeat = ap_uint<128>;
 using ParameterWord = ap_uint<512>;
@@ -74,7 +72,7 @@ struct ActPkt {
   float scale;
 };
 
-using ConvHist = ConvWord[kNumLayers][kMaxLoopCount][kConvKinds][kKeyDim];
+using ConvHist = ConvWord[kNumLayers][kMaxLoopCount][kConvChannels];
 using StateMem = StateBank[8][kSWords];
 using ScratchMem = StateBank[kScratchBanks][kScratchDepth];
 
@@ -460,120 +458,120 @@ static void q8_consume(hls::stream<ParameterWord>& words, int count,
   }
 
   const int last_group = group_count - 1;
-  const int heads = head_o ? kNumHeads : 1;
-
-  for (int head = 0; head < heads; ++head) {
-#pragma HLS LOOP_TRIPCOUNT min = 1 max = 8
-    if (head_o) {
-      const ActPkt pkt = acts.read();
-      input_scale = pkt.scale;
-      for (int lane = 0; lane < kQuantGroupSize; ++lane) {
-#pragma HLS UNROLL
-        input_group[lane] = static_cast<int8_t>(
-            pkt.group.range((lane + 1) * 8 - 1, lane * 8).to_int());
-      }
-    }
-
-    int block = 0;
-    int group = 0;
-    int matrix = 0;
-    int word_in_group = 0;
-    for (int it = 0; it < count; ++it) {
+  int o_group = 0;
+  int block = 0;
+  int group = 0;
+  int matrix = 0;
+  int word_in_group = 0;
+  // Group/head boundaries change addresses, not the MAC pipeline lifetime.
+  for (int it = 0; it < count; ++it) {
 #pragma HLS PIPELINE II = 1
+#pragma HLS LOOP_TRIPCOUNT min = 1728 max = 144000
 #pragma HLS DEPENDENCE variable = acc0 inter false
 #pragma HLS DEPENDENCE variable = acc1 inter false
 #pragma HLS DEPENDENCE variable = o_acc inter false
 #pragma HLS DEPENDENCE variable = best_score inter false
 #pragma HLS DEPENDENCE variable = best_row inter false
-      const ParameterWord word = words.read();
+    const ParameterWord word = words.read();
 
-      if (word_in_group == 0) {
-        scale_word = word;
-        if (!head_o) {
-          unpack_act_group(act, group, input_group, input_scale);
-        }
-      } else {
-        const int pair = word_in_group - 1;
-        const int row0 = pair * 2;
-        const int row1 = row0 + 1;
-        int32_t dot0 = 0;
-        int32_t dot1 = 0;
+    if (word_in_group == 0) {
+      scale_word = word;
+      if (head_o && block == 0) {
+        const ActPkt pkt = acts.read();
+        input_scale = pkt.scale;
         for (int lane = 0; lane < kQuantGroupSize; ++lane) {
 #pragma HLS UNROLL
-          const ap_int<8> w0 = word.range((lane + 1) * 8 - 1, lane * 8);
-          const ap_int<8> w1 =
-              word.range((kQuantGroupSize + lane + 1) * 8 - 1,
-                         (kQuantGroupSize + lane) * 8);
-          dot0 += w0.to_int() * static_cast<int32_t>(input_group[lane]);
-          dot1 += w1.to_int() * static_cast<int32_t>(input_group[lane]);
+          input_group[lane] = static_cast<int8_t>(
+              pkt.group.range((lane + 1) * 8 - 1, lane * 8).to_int());
         }
-        const float partial0 = static_cast<float>(dot0) * input_scale *
-                               unpack_scale(scale_word, row0);
-        const float partial1 = static_cast<float>(dot1) * input_scale *
-                               unpack_scale(scale_word, row1);
-        const float prev0 =
-            group == 0 ? 0.0f : (matrix == 0 ? acc0[row0] : acc1[row0]);
-        const float prev1 =
-            group == 0 ? 0.0f : (matrix == 0 ? acc0[row1] : acc1[row1]);
-        const float sum0 = fadd(prev0, partial0);
-        const float sum1 = fadd(prev1, partial1);
-        if (matrix == 0) {
-          acc0[row0] = sum0;
-          acc0[row1] = sum1;
-        } else {
-          acc1[row0] = sum0;
-          acc1[row1] = sum1;
-        }
-
-        if (group == last_group && (!paired || matrix == 1)) {
-          const int output_row0 = block * kPackedRows + row0;
-          const int output_row1 = output_row0 + 1;
-          const float value0 =
-              paired ? fmul(sfu_silu(acc0[row0]), sum0) : sum0;
-          const float value1 =
-              paired ? fmul(sfu_silu(acc0[row1]), sum1) : sum1;
-          if (argmax_mode) {
-            const int stage0 = output_row0 & (kAccStages - 1);
-            const int stage1 = output_row1 & (kAccStages - 1);
-            if (value0 > best_score[stage0]) {
-              best_score[stage0] = value0;
-              best_row[stage0] = output_row0;
-            }
-            if (value1 > best_score[stage1]) {
-              best_score[stage1] = value1;
-              best_row[stage1] = output_row1;
-            }
-          } else if (head_o) {
-            const float old0 = head == 0 ? 0.0f : o_acc[output_row0];
-            const float old1 = head == 0 ? 0.0f : o_acc[output_row1];
-            const float total0 = fadd(old0, value0);
-            const float total1 = fadd(old1, value1);
-            o_acc[output_row0] = total0;
-            o_acc[output_row1] = total1;
-            if (head == kNumHeads - 1) {
-              o_vec.write(pack2(total0, total1));
-            }
-          } else if (kind == kQ8Qkvg) {
-            qkvg.write(pack2(value0, value1));
-          } else if (kind == kQ8W13) {
-            w13_vec.write(pack2(value0, value1));
-          } else {
-            w2_vec.write(pack2(value0, value1));
-          }
-        }
+      } else if (!head_o) {
+        unpack_act_group(act, group, input_group, input_scale);
+      }
+    } else {
+      const int pair = word_in_group - 1;
+      const int row0 = pair * 2;
+      const int row1 = row0 + 1;
+      int32_t dot0 = 0;
+      int32_t dot1 = 0;
+      for (int lane = 0; lane < kQuantGroupSize; ++lane) {
+#pragma HLS UNROLL
+        const ap_int<8> w0 = word.range((lane + 1) * 8 - 1, lane * 8);
+        const ap_int<8> w1 =
+            word.range((kQuantGroupSize + lane + 1) * 8 - 1,
+                       (kQuantGroupSize + lane) * 8);
+        dot0 += w0.to_int() * static_cast<int32_t>(input_group[lane]);
+        dot1 += w1.to_int() * static_cast<int32_t>(input_group[lane]);
+      }
+      const float partial0 = static_cast<float>(dot0) * input_scale *
+                             unpack_scale(scale_word, row0);
+      const float partial1 = static_cast<float>(dot1) * input_scale *
+                             unpack_scale(scale_word, row1);
+      const float prev0 =
+          group == 0 ? 0.0f : (matrix == 0 ? acc0[row0] : acc1[row0]);
+      const float prev1 =
+          group == 0 ? 0.0f : (matrix == 0 ? acc0[row1] : acc1[row1]);
+      const float sum0 = fadd(prev0, partial0);
+      const float sum1 = fadd(prev1, partial1);
+      if (matrix == 0) {
+        acc0[row0] = sum0;
+        acc0[row1] = sum1;
+      } else {
+        acc1[row0] = sum0;
+        acc1[row1] = sum1;
       }
 
-      if (++word_in_group == kWordsPerGroup) {
-        word_in_group = 0;
-        if (paired && matrix == 0) {
-          matrix = 1;
-        } else if (++group == group_count) {
-          group = 0;
-          matrix = 0;
-          ++block;
+      if (group == last_group && (!paired || matrix == 1)) {
+        const int output_row0 = block * kPackedRows + row0;
+        const int output_row1 = output_row0 + 1;
+        const float value0 =
+            paired ? fmul(sfu_silu(acc0[row0]), sum0) : sum0;
+        const float value1 =
+            paired ? fmul(sfu_silu(acc0[row1]), sum1) : sum1;
+        if (argmax_mode) {
+          const int stage0 = output_row0 & (kAccStages - 1);
+          const int stage1 = output_row1 & (kAccStages - 1);
+          if (value0 > best_score[stage0]) {
+            best_score[stage0] = value0;
+            best_row[stage0] = output_row0;
+          }
+          if (value1 > best_score[stage1]) {
+            best_score[stage1] = value1;
+            best_row[stage1] = output_row1;
+          }
+        } else if (head_o) {
+          const float old0 = o_group == 0 ? 0.0f : o_acc[output_row0];
+          const float old1 = o_group == 0 ? 0.0f : o_acc[output_row1];
+          const float total0 = fadd(old0, value0);
+          const float total1 = fadd(old1, value1);
+          o_acc[output_row0] = total0;
+          o_acc[output_row1] = total1;
+          if (o_group == kValueGroups - 1) {
+            o_vec.write(pack2(total0, total1));
+          }
+        } else if (kind == kQ8Qkvg) {
+          qkvg.write(pack2(value0, value1));
+        } else if (kind == kQ8W13) {
+          w13_vec.write(pack2(value0, value1));
         } else {
-          matrix = 0;
+          w2_vec.write(pack2(value0, value1));
         }
+      }
+    }
+
+    if (++word_in_group == kWordsPerGroup) {
+      word_in_group = 0;
+      if (paired && matrix == 0) {
+        matrix = 1;
+      } else if (++group == group_count) {
+        group = 0;
+        matrix = 0;
+        ++block;
+        if (head_o && block == kDim / kPackedRows) {
+          block = 0;
+          ++o_group;
+        }
+      } else {
+        matrix = 0;
       }
     }
   }
@@ -709,25 +707,25 @@ static float fp8_dot(const float* a, const float* b, int size) {
   return reduce8(acc);
 }
 
-static void fp8_conv(float* channels, ConvHist hist, int layer, int loop, int kind,
+static void fp8_conv(float* channels, ConvHist hist, int layer, int loop,
                      int channel_base,
-                     const float weight[kConvKinds][kKeyDim][kConvSize],
+                     const float weight[kConvChannels][kConvSize],
                      int count, bool valid) {
 #pragma HLS INLINE
   for (int c = 0; c < count; ++c) {
 #pragma HLS PIPELINE II = 1
     const int ch = channel_base + c;
     float h0, h1, h2;
-    unpack3(hist[layer][loop][kind][ch], h0, h1, h2);
+    unpack3(hist[layer][loop][ch], h0, h1, h2);
     const float t0 = valid ? h0 : 0.0f;
     const float t1 = valid ? h1 : 0.0f;
     const float t2 = valid ? h2 : 0.0f;
     const float t3 = channels[c];
     const float sum =
-        fadd(fadd(fmul(t0, weight[kind][ch][0]), fmul(t1, weight[kind][ch][1])),
-             fadd(fmul(t2, weight[kind][ch][2]), fmul(t3, weight[kind][ch][3])));
+        fadd(fadd(fmul(t0, weight[ch][0]), fmul(t1, weight[ch][1])),
+             fadd(fmul(t2, weight[ch][2]), fmul(t3, weight[ch][3])));
     channels[c] = sum;
-    hist[layer][loop][kind][ch] = pack3(t1, t2, t3);
+    hist[layer][loop][ch] = pack3(t1, t2, t3);
   }
   for (int c = 0; c < count; ++c) {
     channels[c] = sfu_silu(channels[c]);
@@ -926,7 +924,7 @@ static void schedule_process(int token, int reset_state, int loop_count,
   post_cmds.write(post);
 
   for (int layer = 0; layer < kNumLayers; ++layer) {
-#pragma HLS LOOP_TRIPCOUNT min = 8 max = 8
+#pragma HLS LOOP_TRIPCOUNT min = 5 max = 5
     const unsigned char layer_id = static_cast<unsigned char>(layer);
 
     for (int loop_i = 0; loop_i < loops; ++loop_i) {
@@ -974,7 +972,7 @@ static void schedule_process(int token, int reset_state, int loop_count,
       post_cmds.write(post);
       sc.hdr = make_hdr(kPhaseLayer, layer_id, loop, kWeightMixerO);
       sc.kind = kScratchORead;
-      scratch_cmds.write(sc);
+      if (loop_i != 0) scratch_cmds.write(sc);
       rt.hdr = sc.hdr;
       route_cmds.write(rt);
       q8.hdr = rt.hdr;
@@ -1101,7 +1099,7 @@ static void memory_process(const ParameterBeat* params, const float* side,
                            hls::stream<uint32_t>& lm_token) {
 #pragma HLS INLINE off
   for (;;) {
-#pragma HLS LOOP_TRIPCOUNT min = 28 max = 28
+#pragma HLS LOOP_TRIPCOUNT min = 19 max = 19
     const MemCmd cmd = cmds.read();
     if (cmd.hdr.phase == kPhaseEnd) {
       break;
@@ -1109,22 +1107,21 @@ static void memory_process(const ParameterBeat* params, const float* side,
     const int layer = cmd.hdr.layer_id;
     if (cmd.kind == kMemEmbed) {
       load_embedding(embed, params, cmd.token);
+      stream_write_vec(embed, side + kSideResidualOffset, kMaxLoopCount * kDim);
       stream_write_vec(rms_final, side + kSideRmsFinalOffset, kDim);
     } else if (cmd.kind == kMemSide) {
       stream_write_vec(rms_att, side + SideRmsAttOffset(layer), kDim);
       stream_write_vec(rms_ffn, side + SideRmsFfnOffset(layer), kDim);
+      stream_write_vec(o_norm, side + SideONormOffset(layer), kHeadVDim);
       stream_write_vec(beta_side, side + SideAProjOffset(layer),
                        kAProjSize + kBProjSize);
       stream_write_vec(beta_side, side + SideAOffset(layer), 2 * kNumHeads);
       stream_write_vec(conv_w, side + SideQConvOffset(layer),
                        kQConvSize + kKConvSize + kVConvSize);
-      stream_write_vec(o_norm, side + SideONormOffset(layer), kHeadVDim);
     } else if (cmd.kind == kMemFill) {
-      // QKVG is consumed while it fills. O is cached in its packed layout and
-      // replayed head-wise after recurrent outputs become ready.
+      // The device packer places O input groups in consumption order too.
       axi_broadcast(axi_out, fill_words, params, PackedQOffset(layer, 0),
-                    kPackedQKVGWords);
-      axi_words(fill_words, params, PackedOOffset(layer), kPackedProjWords);
+                    kMixerCacheWords);
     } else if (cmd.kind == kMemFfnPrefetch) {
       axi_words(fill_words, params, PackedW13Offset(layer), kFfnPackedWords);
     } else if (cmd.kind == kMemLm) {
@@ -1137,11 +1134,11 @@ static void memory_process(const ParameterBeat* params, const float* side,
 
 static ap_uint<14> ring_next(ap_uint<14> ptr) {
 #pragma HLS INLINE
-  const ap_uint<14> next = ptr + 1;
-  if (next >= kFfnRingBase + kFfnRingWords) {
+  // Compare before increment: 16384 is not representable in a 14-bit pointer.
+  if (ptr == kScratchDepth - 1) {
     return static_cast<ap_uint<14>>(kFfnRingBase);
   }
-  return next;
+  return ptr + 1;
 }
 
 static void ring_fill_step(
@@ -1179,7 +1176,7 @@ static void scratch_process(hls::stream<ScratchCmd>& cmds,
 
   for (;;) {
 #pragma HLS LOOP_FLATTEN off
-#pragma HLS LOOP_TRIPCOUNT min = 41 max = 89
+#pragma HLS LOOP_TRIPCOUNT min = 21 max = 51
     const ScratchCmd cmd = cmds.read();
     if (cmd.hdr.phase == kPhaseEnd) {
       break;
@@ -1203,7 +1200,7 @@ static void scratch_process(hls::stream<ScratchCmd>& cmds,
       for (int sent = 0; sent < kPackedQKVGWords;) {
 #pragma HLS PIPELINE II = 1
 #pragma HLS DEPENDENCE variable = scratch inter false
-#pragma HLS LOOP_TRIPCOUNT min = 4608 max = 12000
+#pragma HLS LOOP_TRIPCOUNT min = 5184 max = 12000
         if (sram_words.write_nb(scratch_read(scratch, read_addr))) {
           read_addr++;
           sent++;
@@ -1214,32 +1211,13 @@ static void scratch_process(hls::stream<ScratchCmd>& cmds,
       }
     } else if (cmd.kind == kScratchORead) {
       ap_uint<14> read_addr = kPackedQKVGWords;
-      ap_uint<14> head_base = kPackedQKVGWords;
-      ap_uint<4> head = 0;
-      ap_uint<5> block = 0;
-      ap_uint<4> word = 0;
-      for (int sent = 0; sent < kPackedProjWords;) {
+      for (int sent = 0; sent < kPackedOWords;) {
 #pragma HLS PIPELINE II = 1
 #pragma HLS DEPENDENCE variable = scratch inter false
-#pragma HLS LOOP_TRIPCOUNT min = 1152 max = 5000
+#pragma HLS LOOP_TRIPCOUNT min = 1728 max = 5000
         if (sram_words.write_nb(scratch_read(scratch, read_addr))) {
           sent++;
-          if (word == kWordsPerGroup - 1) {
-            word = 0;
-            if (block == kDim / kPackedRows - 1) {
-              block = 0;
-              head++;
-              head_base += kWordsPerGroup;
-              read_addr = head_base;
-            } else {
-              block++;
-              read_addr += kValueGroups * kWordsPerGroup -
-                           (kWordsPerGroup - 1);
-            }
-          } else {
-            word++;
-            read_addr++;
-          }
+          read_addr++;
         }
         if (ring_active) {
           ring_fill_step(scratch, fill_words, wr_ptr, occupancy, produced);
@@ -1262,39 +1240,41 @@ static void scratch_process(hls::stream<ScratchCmd>& cmds,
       const int word_count = cmd.hdr.weight_kind == kWeightW13
                                  ? 2 * kPackedW13Words
                                  : kPackedW2Words;
+      bool write_pending = false;
       for (int sent = 0; sent < word_count;) {
 #pragma HLS PIPELINE II = 1
 #pragma HLS DEPENDENCE variable = scratch inter false
-#pragma HLS LOOP_TRIPCOUNT min = 3456 max = 16000
+#pragma HLS LOOP_TRIPCOUNT min = 3168 max = 16000
         const ap_uint<14> occupancy_before = occupancy;
         const bool was_full = occupancy_before == kFfnRingWords;
         // Keep producer and consumer addresses separated at the two boundary
         // cases. The ring never depends on same-cycle URAM read/write behavior.
-        const bool can_accept =
-            occupancy_before == 0 || (occupancy_before > 1 && !was_full);
+        const bool can_accept = !was_full;
         ParameterWord incoming;
         bool incoming_valid = false;
         if (can_accept && produced < kFfnPackedWords) {
           incoming_valid = fill_words.read_nb(incoming);
         }
 
-        if (occupancy_before > 0) {
-          sram_words.write(scratch_read(scratch, rd_ptr));
+        // HLS schedules the write one stage after the read. Do not consume
+        // the sole entry in the iteration immediately following its arrival.
+        const bool readable = occupancy_before > 0 &&
+                              !(occupancy_before == 1 && write_pending);
+        if (readable &&
+            sram_words.write_nb(scratch_read(scratch, rd_ptr))) {
           rd_ptr = ring_next(rd_ptr);
           occupancy--;
           sent++;
-
-          if (incoming_valid) {
-            scratch_write(scratch, wr_ptr, incoming);
-            wr_ptr = ring_next(wr_ptr);
-            occupancy++;
-            produced++;
-          }
-        } else if (incoming_valid) {
-          sram_words.write(incoming);
-          produced++;
-          sent++;
         }
+        // Even if Q8 waits for W2 activations, HP0 can keep filling the ring.
+        // Empty/full boundaries never read and write the same address.
+        if (incoming_valid) {
+          scratch_write(scratch, wr_ptr, incoming);
+          wr_ptr = ring_next(wr_ptr);
+          occupancy++;
+          produced++;
+        }
+        write_pending = incoming_valid;
       }
 
       if (cmd.hdr.weight_kind == kWeightW2) {
@@ -1310,7 +1290,7 @@ static void weight_router(hls::stream<RouteCmd>& cmds,
                           hls::stream<ParameterWord>& weights) {
 #pragma HLS INLINE off
   for (;;) {
-#pragma HLS LOOP_TRIPCOUNT min = 34 max = 82
+#pragma HLS LOOP_TRIPCOUNT min = 22 max = 52
     const RouteCmd cmd = cmds.read();
     if (cmd.hdr.phase == kPhaseEnd) {
       break;
@@ -1318,13 +1298,14 @@ static void weight_router(hls::stream<RouteCmd>& cmds,
     const int count = cmd.hdr.weight_kind == kWeightMixerQkvg
                           ? kPackedQKVGWords
                       : cmd.hdr.weight_kind == kWeightMixerO
-                          ? kPackedProjWords
+                          ? kPackedOWords
                       : cmd.hdr.weight_kind == kWeightW13
                           ? 2 * kPackedW13Words
                       : cmd.hdr.weight_kind == kWeightW2 ? kPackedW2Words
                                                         : kPackedTokWords;
     const bool from_sram = cmd.hdr.weight_kind != kWeightLm &&
-                           (cmd.hdr.weight_kind != kWeightMixerQkvg ||
+                           ((cmd.hdr.weight_kind != kWeightMixerQkvg &&
+                             cmd.hdr.weight_kind != kWeightMixerO) ||
                             cmd.hdr.loop_id != 0);
     if (from_sram) {
       for (int it = 0; it < count; ++it) {
@@ -1348,7 +1329,7 @@ static void q8_process(hls::stream<Q8Cmd>& cmds, hls::stream<ParameterWord>& wei
                        hls::stream<uint32_t>& lm_token) {
 #pragma HLS INLINE off
   for (;;) {
-#pragma HLS LOOP_TRIPCOUNT min = 34 max = 82
+#pragma HLS LOOP_TRIPCOUNT min = 22 max = 52
     const Q8Cmd cmd = cmds.read();
     if (cmd.hdr.phase == kPhaseEnd) {
       break;
@@ -1356,8 +1337,7 @@ static void q8_process(hls::stream<Q8Cmd>& cmds, hls::stream<ParameterWord>& wei
     const bool paired = cmd.kind == kQ8W13;
     const bool argmax_mode = cmd.kind == kQ8Lm;
     const bool head_o = cmd.kind == kQ8O;
-    const int repeats = cmd.kind == kQ8Qkvg ? kNumHeads : 1;
-    const int rows = cmd.kind == kQ8Qkvg ? kQkvgRows
+    const int rows = cmd.kind == kQ8Qkvg ? kNumHeads * kQkvgRows
                      : cmd.kind == kQ8W13 ? kHiddenDim
                      : cmd.kind == kQ8Lm  ? kVocabSize
                                           : kDim;
@@ -1365,19 +1345,16 @@ static void q8_process(hls::stream<Q8Cmd>& cmds, hls::stream<ParameterWord>& wei
                        : cmd.kind == kQ8W2  ? kHiddenGroups
                                            : kDimGroups;
     const int count =
-        head_o ? kPackedOHeadWords : q8_word_count(rows, groups, paired);
+        head_o ? kPackedOWords : q8_word_count(rows, groups, paired);
     ActTable act;
     if (!head_o) {
       load_act(acts, act, groups);
     }
-    for (int r = 0; r < repeats; ++r) {
-#pragma HLS LOOP_TRIPCOUNT min = 1 max = 8
-      uint32_t token = 0;
-      q8_consume(weights, count, groups, act, acts, paired, argmax_mode, head_o,
-                 cmd.kind, qkvg, o_vec, w13_vec, w2_vec, &token);
-      if (argmax_mode) {
-        lm_token.write(token);
-      }
+    uint32_t token = 0;
+    q8_consume(weights, count, groups, act, acts, paired, argmax_mode, head_o,
+               cmd.kind, qkvg, o_vec, w13_vec, w2_vec, &token);
+    if (argmax_mode) {
+      lm_token.write(token);
     }
   }
 }
@@ -1390,7 +1367,7 @@ static void beta_process(hls::stream<StageCmd>& cmds, hls::stream<float>& beta_s
   float a_decay[kNumHeads];
   float dt_bias[kNumHeads];
   for (;;) {
-#pragma HLS LOOP_TRIPCOUNT min = 9 max = 33
+#pragma HLS LOOP_TRIPCOUNT min = 6 max = 21
     const StageCmd cmd = cmds.read();
     if (cmd.hdr.phase == kPhaseEnd) {
       break;
@@ -1414,7 +1391,7 @@ static void beta_process(hls::stream<StageCmd>& cmds, hls::stream<float>& beta_s
     }
     stream_read_vec(attn_norm, norm, kDim);
     for (int h = 0; h < kNumHeads; ++h) {
-#pragma HLS LOOP_TRIPCOUNT min = 8 max = 8
+#pragma HLS LOOP_TRIPCOUNT min = 6 max = 6
       float beta = 0.0f;
       float decay = 0.0f;
       fp8_beta_decay(norm, b_proj[h], a_proj[h], a_decay[h], dt_bias[h], beta,
@@ -1447,10 +1424,10 @@ static void conv_process(hls::stream<StageCmd>& cmds, hls::stream<int>& reset,
     }
   }
   const float q_scale = q_scale_s.read();
-  float conv_w[kConvKinds][kKeyDim][kConvSize];
+  float conv_w[kConvChannels][kConvSize];
 
   for (;;) {
-#pragma HLS LOOP_TRIPCOUNT min = 9 max = 33
+#pragma HLS LOOP_TRIPCOUNT min = 6 max = 21
     const StageCmd cmd = cmds.read();
     if (cmd.hdr.phase == kPhaseEnd) {
       break;
@@ -1458,17 +1435,15 @@ static void conv_process(hls::stream<StageCmd>& cmds, hls::stream<int>& reset,
     const int layer = cmd.hdr.layer_id;
     const int loop = cmd.hdr.loop_id;
     if (loop == 0) {
-      for (int kind = 0; kind < kConvKinds; ++kind) {
-        for (int c = 0; c < kKeyDim; ++c) {
-          for (int t = 0; t < kConvSize; ++t) {
+      for (int c = 0; c < kConvChannels; ++c) {
+        for (int t = 0; t < kConvSize; ++t) {
 #pragma HLS PIPELINE II = 1
-            conv_w[kind][c][t] = conv_w_s.read();
-          }
+          conv_w[c][t] = conv_w_s.read();
         }
       }
     }
     for (int h = 0; h < kNumHeads; ++h) {
-#pragma HLS LOOP_TRIPCOUNT min = 8 max = 8
+#pragma HLS LOOP_TRIPCOUNT min = 6 max = 6
       float q[kHeadKDim];
       float k[kHeadKDim];
       float v[kHeadVDim];
@@ -1479,9 +1454,10 @@ static void conv_process(hls::stream<StageCmd>& cmds, hls::stream<int>& reset,
       stream_read_pairs(qkvg, g, kHeadVDim);
       const int base = h * kHeadKDim;
       const bool seen = valid[layer][loop][h];
-      fp8_conv(q, hist, layer, loop, 0, base, conv_w, kHeadKDim, seen);
-      fp8_conv(k, hist, layer, loop, 1, base, conv_w, kHeadKDim, seen);
-      fp8_conv(v, hist, layer, loop, 2, base, conv_w, kHeadVDim, seen);
+      fp8_conv(q, hist, layer, loop, base, conv_w, kHeadKDim, seen);
+      fp8_conv(k, hist, layer, loop, kKeyDim + base, conv_w, kHeadKDim, seen);
+      fp8_conv(v, hist, layer, loop, 2 * kKeyDim + h * kHeadVDim,
+               conv_w, kHeadVDim, seen);
       fp8_l2scale(q, kHeadKDim, q_scale);
       fp8_l2scale(k, kHeadKDim, 1.0f);
       stream_write_pairs(convd, q, kHeadKDim);
@@ -1494,7 +1470,6 @@ static void conv_process(hls::stream<StageCmd>& cmds, hls::stream<int>& reset,
 }
 
 static void rec_process(hls::stream<StageCmd>& cmds, hls::stream<int>& reset,
-                        hls::stream<float>& o_norm_s,
                         hls::stream<FloatPair>& convd,
                         hls::stream<float>& betas,
                         hls::stream<FloatPair>& heads) {
@@ -1506,7 +1481,6 @@ static void rec_process(hls::stream<StageCmd>& cmds, hls::stream<int>& reset,
 #pragma HLS ARRAY_PARTITION variable = valid complete dim = 0
 
   const int reset_state = reset.read();
-  float o_norm[kHeadVDim];
   if (reset_state) {
     for (int layer = 0; layer < kNumLayers; ++layer) {
       for (int loop = 0; loop < kMaxLoopCount; ++loop) {
@@ -1519,18 +1493,15 @@ static void rec_process(hls::stream<StageCmd>& cmds, hls::stream<int>& reset,
   }
 
   for (;;) {
-#pragma HLS LOOP_TRIPCOUNT min = 9 max = 33
+#pragma HLS LOOP_TRIPCOUNT min = 6 max = 21
     const StageCmd cmd = cmds.read();
     if (cmd.hdr.phase == kPhaseEnd) {
       break;
     }
     const int layer = cmd.hdr.layer_id;
     const int loop = cmd.hdr.loop_id;
-    if (loop == 0) {
-      stream_read_vec(o_norm_s, o_norm, kHeadVDim);
-    }
     for (int h = 0; h < kNumHeads; ++h) {
-#pragma HLS LOOP_TRIPCOUNT min = 8 max = 8
+#pragma HLS LOOP_TRIPCOUNT min = 6 max = 6
       float q[kHeadKDim];
       float k[kHeadKDim];
       float v[kHeadVDim];
@@ -1544,8 +1515,8 @@ static void rec_process(hls::stream<StageCmd>& cmds, hls::stream<int>& reset,
       const float decay = betas.read();
       fp8_recurrence(S, loop, layer, h, q, k, v, beta, decay, valid[layer][loop][h],
                      out);
-      fp8_head_norm_gate(out, g, o_norm);
       stream_write_pairs(heads, out, kHeadVDim);
+      stream_write_pairs(heads, g, kHeadVDim);
       valid[layer][loop][h] = true;
     }
   }
@@ -1554,6 +1525,7 @@ static void rec_process(hls::stream<StageCmd>& cmds, hls::stream<int>& reset,
 static void post_process(hls::stream<PostCmd>& cmds, hls::stream<float>& embed,
                          hls::stream<float>& rms_final, hls::stream<float>& rms_att,
                          hls::stream<float>& rms_ffn,
+                         hls::stream<float>& o_norm_s,
                          hls::stream<FloatPair>& rec_heads,
                          hls::stream<FloatPair>& o_vec,
                          hls::stream<FloatPair>& w13_vec,
@@ -1566,22 +1538,26 @@ static void post_process(hls::stream<PostCmd>& cmds, hls::stream<float>& embed,
 #pragma HLS ALLOCATION operation instances = fadd limit = 16
   float x[kHiddenDim];
   float tmp[kHiddenDim];
-  float fused[kHiddenDim];
   float weight[kDim];
+  float o_norm[kHeadVDim];
+  float gate[kHeadVDim];
+  float residual[kMaxLoopCount * kDim];
   ActTable act;
 
   for (;;) {
-#pragma HLS LOOP_TRIPCOUNT min = 51 max = 123
+#pragma HLS LOOP_TRIPCOUNT min = 33 max = 78
     const PostCmd cmd = cmds.read();
     if (cmd.hdr.phase == kPhaseEnd) {
       break;
     }
     if (cmd.kind == kPostEmbed) {
       stream_read_vec(embed, x, kDim);
+      stream_read_vec(embed, residual, kMaxLoopCount * kDim);
       q_scale_s.write(sfu_rsqrt(static_cast<float>(kHeadKDim)));
     } else if (cmd.kind == kPostAttn) {
       if (cmd.hdr.loop_id == 0) {
         stream_read_vec(rms_att, weight, kDim);
+        stream_read_vec(o_norm_s, o_norm, kHeadVDim);
       }
       fp8_rmsnorm(tmp, x, weight, kDim);
       fp8_quantize(act, tmp, kDim);
@@ -1590,12 +1566,21 @@ static void post_process(hls::stream<PostCmd>& cmds, hls::stream<float>& embed,
     } else if (cmd.kind == kPostPackO) {
       for (int h = 0; h < kNumHeads; ++h) {
         stream_read_pairs(rec_heads, tmp, kHeadVDim);
-        fp8_quantize_group(act, 0, tmp);
-        emit_act(acts, act, 1);
+        stream_read_pairs(rec_heads, gate, kHeadVDim);
+        // Post owns normalization so recurrence can start the next head.
+        fp8_head_norm_gate(tmp, gate, o_norm);
+        for (int group = 0; group < kHeadVDim / kQuantGroupSize; ++group) {
+          fp8_quantize_group(act, 0, tmp + group * kQuantGroupSize);
+          emit_act(acts, act, 1);
+        }
       }
     } else if (cmd.kind == kPostResO) {
       stream_read_pairs(o_vec, tmp, kDim);
-      fp8_residual(x, tmp, kDim);
+      for (int i = 0; i < kDim; ++i) {
+#pragma HLS PIPELINE II = 1
+        x[i] = fadd(fadd(x[i], tmp[i]),
+                    fmul(residual[cmd.hdr.loop_id * kDim + i], x[i]));
+      }
     } else if (cmd.kind == kPostFfn) {
       ffn_ready.write(cmd.hdr.layer_id);
       stream_read_vec(rms_ffn, weight, kDim);
@@ -1603,9 +1588,13 @@ static void post_process(hls::stream<PostCmd>& cmds, hls::stream<float>& embed,
       fp8_quantize(act, tmp, kDim);
       emit_act(acts, act, kDimGroups);
     } else if (cmd.kind == kPostW13) {
-      stream_read_pairs(w13_vec, fused, kHiddenDim);
-      fp8_quantize(act, fused, kHiddenDim);
-      emit_act(acts, act, kHiddenGroups);
+      // Quantize completed groups while Q8 produces the remaining W1/W3 rows.
+      // The activation FIFO holds all groups until that same Q8 owner starts W2.
+      for (int group = 0; group < kHiddenGroups; ++group) {
+        stream_read_pairs(w13_vec, tmp, kQuantGroupSize);
+        fp8_quantize_group(act, 0, tmp);
+        emit_act(acts, act, 1);
+      }
     } else if (cmd.kind == kPostResW2) {
       stream_read_pairs(w2_vec, tmp, kDim);
       fp8_residual(x, tmp, kDim);
@@ -1750,10 +1739,15 @@ void decode(int token, int reset_state, int loop_count,
   q8_process(q8_cmds, weights, acts, qkvg, o_vec, w13_vec, w2_vec, lm_token);
   beta_process(beta_cmds, beta_side, attn_norm, betas);
   conv_process(conv_cmds, conv_reset, q_scale, conv_w, qkvg, convd);
-  rec_process(rec_cmds, rec_reset, o_norm, convd, betas, rec_heads);
-  post_process(post_cmds, embed, rms_final, rms_att, rms_ffn, rec_heads, o_vec,
+  rec_process(rec_cmds, rec_reset, convd, betas, rec_heads);
+  post_process(post_cmds, embed, rms_final, rms_att, rms_ffn, o_norm, rec_heads, o_vec,
                w13_vec, w2_vec, q_scale, attn_norm, acts, ffn_ready);
 #else
+#ifdef __HLS_COSIM__
+  // The C co-sim deadlock checker otherwise assumes a single-threaded caller.
+  // Register our nine workers, just as hls::task does; RTL checking stays on.
+  for (int i = 0; i < 9; ++i) hls::stream_globals<false>::incr_task_counter();
+#endif
   std::thread t_ctrl([&] {
     schedule_process(token, reset_state, loop_count, mem_cmds, scratch_cmds,
                      route_cmds, q8_cmds, beta_cmds, conv_cmds, rec_cmds,
@@ -1777,10 +1771,10 @@ void decode(int token, int reset_state, int loop_count,
   std::thread t_conv(
       [&] { conv_process(conv_cmds, conv_reset, q_scale, conv_w, qkvg, convd); });
   std::thread t_rec([&] {
-    rec_process(rec_cmds, rec_reset, o_norm, convd, betas, rec_heads);
+    rec_process(rec_cmds, rec_reset, convd, betas, rec_heads);
   });
   std::thread t_post([&] {
-    post_process(post_cmds, embed, rms_final, rms_att, rms_ffn, rec_heads, o_vec,
+    post_process(post_cmds, embed, rms_final, rms_att, rms_ffn, o_norm, rec_heads, o_vec,
                  w13_vec, w2_vec, q_scale, attn_norm, acts, ffn_ready);
   });
   t_ctrl.join();
@@ -1792,6 +1786,9 @@ void decode(int token, int reset_state, int loop_count,
   t_conv.join();
   t_rec.join();
   t_post.join();
+#ifdef __HLS_COSIM__
+  for (int i = 0; i < 9; ++i) hls::stream_globals<false>::decr_task_counter();
+#endif
 #endif
 }
 
@@ -1986,7 +1983,9 @@ void CpuForward(RunState& s, const Weights& w, int token, float* logits,
       }
       Quantize(s.xq_q.data(), s.xq_s.data(), s.linear_out.data(), kValueDim);
       Matmul(s.xb.data(), s.xq_q.data(), s.xq_s.data(), l.o_proj);
-      for (int i = 0; i < kDim; ++i) s.x[i] += s.xb[i];
+      for (int i = 0; i < kDim; ++i) {
+        s.x[i] = (s.x[i] + s.xb[i]) + w.residual[loop * kDim + i] * s.x[i];
+      }
     }
 
     // FFN.

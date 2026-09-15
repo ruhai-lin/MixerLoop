@@ -1,5 +1,6 @@
 #include "weight.hpp"
 
+#include <cmath>
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
@@ -8,6 +9,8 @@ namespace gdn {
 namespace {
 
 struct CheckpointHeader {
+  std::uint32_t magic;
+  int version;
   int dim;
   int hidden_dim;
   int n_layers;
@@ -18,8 +21,17 @@ struct CheckpointHeader {
   int vocab_size;
   int seq_len;
   int shared_classifier;
-  int pad;
+  int loop_count;
+  int group_size;
+  int model_type;
+  int residual;
+  int weight_dtype;
+  int scale_dtype;
+  int side_dtype;
+  int state_dtype;
+  float norm_eps;
 };
+static_assert(sizeof(CheckpointHeader) == 84, "GDNe v3 header field layout");
 
 void ReadFp32(std::ifstream& fs, std::vector<float>& out, std::size_t count,
               const char* name) {
@@ -28,6 +40,11 @@ void ReadFp32(std::ifstream& fs, std::vector<float>& out, std::size_t count,
           static_cast<std::streamsize>(count * sizeof(float)));
   if (!fs) {
     throw std::runtime_error(std::string("failed reading fp32 tensor: ") + name);
+  }
+  for (float value : out) {
+    if (!std::isfinite(value)) {
+      throw std::runtime_error(std::string("nonfinite tensor: ") + name);
+    }
   }
 }
 
@@ -44,6 +61,14 @@ QuantizedTensor ReadQ8(std::ifstream& fs, int rows, int cols, const char* name) 
           static_cast<std::streamsize>(t.s.size() * sizeof(float)));
   if (!fs) {
     throw std::runtime_error(std::string("failed reading q8 tensor: ") + name);
+  }
+  for (auto value : t.q) {
+    if (value == -128) throw std::runtime_error("invalid symmetric int8 weight");
+  }
+  for (float value : t.s) {
+    if (!std::isfinite(value) || value <= 0) {
+      throw std::runtime_error("invalid Q8 scale");
+    }
   }
   return t;
 }
@@ -114,36 +139,41 @@ void LoadWeights(Weights& w, const std::string& path) {
     throw std::runtime_error("could not open checkpoint: " + path);
   }
 
-  std::uint32_t magic = 0;
-  int version = 0;
   CheckpointHeader h{};
-  int group_size = 0;
-  fs.read(reinterpret_cast<char*>(&magic), sizeof(magic));
-  fs.read(reinterpret_cast<char*>(&version), sizeof(version));
+  char reserved[kCheckpointHeaderBytes - sizeof(h)]{};
   fs.read(reinterpret_cast<char*>(&h), sizeof(h));
-  fs.read(reinterpret_cast<char*>(&group_size), sizeof(group_size));
+  fs.read(reserved, sizeof(reserved));
   if (!fs) {
     throw std::runtime_error("failed to read checkpoint header");
   }
-  if (magic != kCheckpointMagic || version != kCheckpointVersion) {
-    throw std::runtime_error("bad GDN Q8 checkpoint magic/version");
+  if (h.magic != kCheckpointMagic || h.version != kCheckpointVersion) {
+    throw std::runtime_error("expected GDNe v3; use release 20fbcee for legacy v2 weights");
+  }
+  // Model IDs: GDN=1, MixerLoop=2. Dtype IDs: INT8=1, FP32=2.
+  if ((h.model_type != 1 && h.model_type != 2) ||
+      h.residual != (h.model_type == 2) || h.weight_dtype != 1 ||
+      h.scale_dtype != 2 || h.side_dtype != 2 || h.state_dtype != 2 ||
+      h.norm_eps != 1e-5f) {
+    throw std::runtime_error("unsupported GDNe v3 semantics/dtypes");
+  }
+  for (char byte : reserved) {
+    if (byte != 0) throw std::runtime_error("nonzero reserved header bytes");
   }
   if (h.dim != kDim || h.hidden_dim != kHiddenDim || h.n_layers != kNumLayers ||
       h.num_heads != kNumHeads || h.head_k_dim != kHeadKDim ||
       h.head_v_dim != kHeadVDim || h.conv_size != kConvSize ||
       h.vocab_size != kVocabSize || h.shared_classifier != 1 ||
-      group_size != kQuantGroupSize) {
+      h.group_size != kQuantGroupSize) {
     throw std::runtime_error("checkpoint config does not match gdn.hls constants");
   }
   if (h.seq_len < 1 || h.seq_len > kSeqLen) {
     throw std::runtime_error("checkpoint seq_len exceeds the hardware profile");
   }
-  if (h.pad != 0 && (h.pad < 1 || h.pad > kMaxLoopCount)) {
-    throw std::runtime_error("checkpoint loop_count (header pad) is out of range");
+  if (h.loop_count < 1 || h.loop_count > kMaxLoopCount ||
+      (h.model_type == 1 && h.loop_count != 1)) {
+    throw std::runtime_error("invalid checkpoint loop_count");
   }
-  w.loop_count = h.pad;
-
-  fs.seekg(kCheckpointHeaderBytes, std::ios::beg);
+  w.loop_count = h.loop_count;
 
   w.tok_emb = ReadQ8(fs, kVocabSize, kDim, "embedding");
 
@@ -170,6 +200,12 @@ void LoadWeights(Weights& w, const std::string& path) {
     l.w3 = ReadQ8(fs, kHiddenDim, kDim, "w3");
   }
   ReadFp32(fs, w.rms_final, kDim, "rms_final");
+  w.residual.clear();
+  if (h.residual) ReadFp32(fs, w.residual, h.loop_count * kDim, "residual_weight");
+  w.residual.resize(kMaxLoopCount * kDim, 0.0f);
+  if (fs.peek() != std::ifstream::traits_type::eof()) {
+    throw std::runtime_error("trailing bytes after checkpoint payload");
+  }
 }
 
 std::vector<std::uint8_t> PackParameters(const Weights& w) {
@@ -184,7 +220,12 @@ std::vector<std::uint8_t> PackParameters(const Weights& w) {
       PackRows(l.v_proj, head * kHeadVDim, kHeadVDim, blob);
       PackRows(l.g_proj, head * kHeadVDim, kHeadVDim, blob);
     }
-    PackMatrix(l.o_proj, blob);
+    // O input groups are replayed in order, each across all output rows.
+    for (int group = 0; group < kValueGroups; ++group) {
+      for (int row = 0; row < kDim; row += kPackedRows) {
+        PackGroup(l.o_proj, row, group, blob);
+      }
+    }
     PackPair(l.w1, l.w3, blob);
     PackMatrix(l.w2, blob);
   }
@@ -215,6 +256,7 @@ std::vector<float> BuildFp32Side(const Weights& w) {
     AppendFloats(side, l.dt_bias);
     AppendFloats(side, l.o_norm);
   }
+  AppendFloats(side, w.residual);
   if (side.size() != static_cast<std::size_t>(kSideFloatCount)) {
     throw std::runtime_error("fp32 side size mismatch");
   }

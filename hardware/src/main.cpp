@@ -125,7 +125,7 @@ static int SampleToken(Sampler& sampler, std::vector<float>& logits) {
 #endif // USE_CPU_ONLY
 
 struct Args {
-  std::string weight_path = "./model/climbmix15M_demo_q8.bin";
+  std::string weight_path = "./model/climbmix-10B-s1337-q8.bin";
   std::string vocab_path = "./model/tokenizer.bin";
   std::string xclbin_path = "./binary_container_1.bin";
   std::string prompt = "";
@@ -141,20 +141,7 @@ static int ResolveLoopCount(int cli, int header) {
   if (cli != 0 && (cli < 1 || cli > gdn::kMaxLoopCount)) {
     throw std::runtime_error("--loop_count must be between 1 and 4");
   }
-  if (cli != 0 && header != 0 && cli != header) {
-    throw std::runtime_error("loop_count mismatch: --loop_count " +
-                             std::to_string(cli) + " vs header " +
-                             std::to_string(header));
-  }
-  if (cli != 0) {
-    return cli;
-  }
-  if (header != 0) {
-    return header;
-  }
-  throw std::runtime_error(
-      "loop_count unspecified: pass --loop_count or store T in the checkpoint "
-      "header pad");
+  return cli != 0 ? cli : header;
 }
 
 static void ParseArgs(int argc, char** argv, Args& args) {
@@ -195,7 +182,7 @@ static void ParseArgs(int argc, char** argv, Args& args) {
 static void PrintUsage(const char* exe) {
   std::cout << "Usage: " << exe << " [options]\n"
             << "  --weight_path PATH   GDN Q8 checkpoint, default "
-               "./model/climbmix15M_demo_q8.bin\n"
+               "./model/climbmix-10B-s1337-q8.bin\n"
             << "  --vocab_path PATH    tokenizer.bin, default ./model/tokenizer.bin\n"
             << "  --xclbin PATH        XRT binary, default ./binary_container_1.bin\n"
             << "  -i, --prompt TEXT    Prompt text\n"
@@ -203,7 +190,7 @@ static void PrintUsage(const char* exe) {
             << "  -t, --temp FLOAT     Temperature, 0 means argmax\n"
             << "  -p, --topp FLOAT     Top-p threshold, default 0.9\n"
             << "  -s, --seed INT       RNG seed\n"
-            << "  --loop_count N       Mixer loops, 1 or 4; default is the "
+            << "  --loop_count N       Runtime override, 1..4; default is the "
                "checkpoint header\n";
 }
 
@@ -220,7 +207,7 @@ int main(int argc, char** argv) {
     gdn::LoadWeights(weights, args.weight_path);
     const int loop_count = ResolveLoopCount(args.loop_count, weights.loop_count);
 
-    std::cout << "GDN 15M constants\n"
+    std::cout << "GDN / MixerLoop 13m profile\n"
               << "  dim       : " << gdn::kDim << "\n"
               << "  hidden_dim: " << gdn::kHiddenDim << "\n"
               << "  n_layers  : " << gdn::kNumLayers << "\n"
@@ -323,6 +310,7 @@ int main(int argc, char** argv) {
 
     int token = prompt_tokens[0];
     int next = token;
+    int decoded = 0;
     const auto start = std::chrono::steady_clock::now();
 
     for (int pos = 0; pos < args.max_seq; ++pos) {
@@ -336,6 +324,7 @@ int main(int argc, char** argv) {
       }
 #endif
 
+      ++decoded;
       if (pos + 1 < static_cast<int>(prompt_tokens.size())) {
         next = prompt_tokens[pos + 1];
       } else {
@@ -357,7 +346,8 @@ int main(int argc, char** argv) {
     const auto end = std::chrono::steady_clock::now();
     const double seconds = std::chrono::duration<double>(end - start).count();
     std::cout << "Time : " << seconds << "[s]\n"
-              << "Speed: " << args.max_seq / seconds << "[tok/s]" << std::endl;
+              << "Steps: " << decoded << "\n"
+              << "Speed: " << decoded / seconds << "[tok/s]" << std::endl;
     std::cout.flush();
     std::exit(EXIT_SUCCESS);
   } catch (const std::exception& e) {

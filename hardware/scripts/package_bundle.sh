@@ -3,12 +3,12 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 PROJECT=$(cd -- "$SCRIPT_DIR/.." && pwd)
-MODEL_DIR=${1:-$PROJECT/model}
+WEIGHT_PATH=${1:-$PROJECT/model/climbmix-10B-s1337-q8.bin}
 VITIS_ROOT=${XILINX_VITIS:-/opt/xilinx/2025.2/Vitis}
 PLATFORM_ROOT=${PLATFORM_ROOT:-$VITIS_ROOT/base_platforms/xilinx_kv260_base_202520_1}
 XCLBIN="$PROJECT/outputs/link/binary_container_1.xclbin"
 BUNDLE="$PROJECT/outputs/bundle"
-TOKENIZER_PATH=${TOKENIZER_PATH:-$MODEL_DIR/tokenizer.bin}
+TOKENIZER_PATH=${TOKENIZER_PATH:-$PROJECT/model/tokenizer.bin}
 
 if [[ ! -f "$XCLBIN" ]]; then
   echo "missing xclbin: $XCLBIN (run scripts/build_link.sh first)" >&2
@@ -22,12 +22,10 @@ if [[ ! -f "$TOKENIZER_PATH" ]]; then
   echo "missing tokenizer.bin: $TOKENIZER_PATH" >&2
   exit 1
 fi
-for name in tinystories15m_t1_q8.bin tinystories15m_t4_q8.bin; do
-  if [[ ! -f "$MODEL_DIR/$name" ]]; then
-    echo "missing weight: $MODEL_DIR/$name" >&2
-    exit 1
-  fi
-done
+if [[ ! -f "$WEIGHT_PATH" ]]; then
+  echo "missing weight: $WEIGHT_PATH" >&2
+  exit 1
+fi
 
 if [[ "$BUNDLE" != "$PROJECT/outputs/bundle" ]]; then
   echo "refusing to clean unexpected bundle path: $BUNDLE" >&2
@@ -39,8 +37,7 @@ mkdir -p "$BUNDLE/model"
 cp -f "$PROJECT/outputs/host/gdn_host" "$BUNDLE/gdn_host"
 cp -f "$XCLBIN" "$BUNDLE/binary_container_1.bin"
 cp -f "$TOKENIZER_PATH" "$BUNDLE/model/tokenizer.bin"
-cp -f "$MODEL_DIR/tinystories15m_t1_q8.bin" "$BUNDLE/model/"
-cp -f "$MODEL_DIR/tinystories15m_t4_q8.bin" "$BUNDLE/model/"
+cp -f "$WEIGHT_PATH" "$BUNDLE/model/"
 
 if [[ -f "$PLATFORM_ROOT/sw/boot/pl.dtbo" ]]; then
   cp -f "$PLATFORM_ROOT/sw/boot/pl.dtbo" "$BUNDLE/pl.dtbo"

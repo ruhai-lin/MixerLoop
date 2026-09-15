@@ -8,11 +8,11 @@ namespace gdn {
 
 // Model.
 constexpr int kDim = 256;
-constexpr int kHiddenDim = 768;
-constexpr int kNumLayers = 8;
-constexpr int kNumHeads = 8;
+constexpr int kHiddenDim = 704;
+constexpr int kNumLayers = 5;
+constexpr int kNumHeads = 6;
 constexpr int kHeadKDim = 32;
-constexpr int kHeadVDim = 32;
+constexpr int kHeadVDim = 64;
 constexpr int kConvSize = 4;
 constexpr int kVocabSize = 32000;
 constexpr int kSeqLen = 1024;
@@ -22,7 +22,7 @@ constexpr int kValueDim = kNumHeads * kHeadVDim;
 
 // Checkpoint and Q8 packing.
 constexpr std::uint32_t kCheckpointMagic = 0x47444e65u; // "GDNe"
-constexpr int kCheckpointVersion = 2;
+constexpr int kCheckpointVersion = 3;
 constexpr int kCheckpointHeaderBytes = 256;
 constexpr int kQuantGroupSize = 32;
 constexpr int kDimGroups = kDim / kQuantGroupSize;
@@ -38,34 +38,37 @@ constexpr int PackedMatrixWords(int rows, int groups) {
 }
 
 constexpr int kPackedTokWords = PackedMatrixWords(kVocabSize, kDimGroups);
-constexpr int kPackedProjWords = PackedMatrixWords(kDim, kDimGroups);
-constexpr int kPackedHeadWords = PackedMatrixWords(kHeadKDim, kDimGroups);
-constexpr int kPackedQKVGWords = 4 * kNumHeads * kPackedHeadWords;
+constexpr int kPackedOWords = PackedMatrixWords(kDim, kValueGroups);
+constexpr int kPackedKeyHeadWords = PackedMatrixWords(kHeadKDim, kDimGroups);
+constexpr int kPackedValueHeadWords = PackedMatrixWords(kHeadVDim, kDimGroups);
+constexpr int kPackedQKVGWords =
+    2 * kNumHeads * (kPackedKeyHeadWords + kPackedValueHeadWords);
 constexpr int kPackedW13Words = PackedMatrixWords(kHiddenDim, kDimGroups);
 constexpr int kPackedW2Words = PackedMatrixWords(kDim, kHiddenGroups);
 
 constexpr int PackedLayerBase(int layer) {
   return kPackedTokWords +
-         layer * (kPackedQKVGWords + kPackedProjWords +
+         layer * (kPackedQKVGWords + kPackedOWords +
                   2 * kPackedW13Words + kPackedW2Words);
 }
 constexpr int PackedQOffset(int layer, int head) {
-  return PackedLayerBase(layer) + 4 * head * kPackedHeadWords;
+  return PackedLayerBase(layer) +
+         2 * head * (kPackedKeyHeadWords + kPackedValueHeadWords);
 }
 constexpr int PackedKOffset(int layer, int head) {
-  return PackedQOffset(layer, head) + kPackedHeadWords;
+  return PackedQOffset(layer, head) + kPackedKeyHeadWords;
 }
 constexpr int PackedVOffset(int layer, int head) {
-  return PackedKOffset(layer, head) + kPackedHeadWords;
+  return PackedKOffset(layer, head) + kPackedKeyHeadWords;
 }
 constexpr int PackedGOffset(int layer, int head) {
-  return PackedVOffset(layer, head) + kPackedHeadWords;
+  return PackedVOffset(layer, head) + kPackedValueHeadWords;
 }
 constexpr int PackedOOffset(int layer) {
   return PackedLayerBase(layer) + kPackedQKVGWords;
 }
 constexpr int PackedW13Offset(int layer) {
-  return PackedOOffset(layer) + kPackedProjWords;
+  return PackedOOffset(layer) + kPackedOWords;
 }
 constexpr int PackedW2Offset(int layer) {
   return PackedW13Offset(layer) + 2 * kPackedW13Words;
@@ -116,7 +119,8 @@ constexpr int SideDtBiasOffset(int layer) {
 constexpr int SideONormOffset(int layer) {
   return SideDtBiasOffset(layer) + kNumHeads;
 }
-constexpr int kSideFloatCount = SideLayerBase(kNumLayers);
+constexpr int kSideResidualOffset = SideLayerBase(kNumLayers);
+constexpr int kSideFloatCount = kSideResidualOffset + kMaxLoopCount * kDim;
 
 constexpr std::size_t kSStateCount = static_cast<std::size_t>(kMaxLoopCount) *
                                      kNumLayers * kNumHeads * kHeadKDim *

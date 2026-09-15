@@ -118,6 +118,19 @@ This exports HF only; no Q8 or hardware tokenizer is produced.
 DCP and logs remain local in the run directory. Upload only HF model/tokenizer
 files and `eval/core_eval.csv`, never the whole training directory.
 
+For local hardware PTQ after HF export:
+
+```bash
+python hardware/quantization.py --checkpoint outputs/mixerloop-13m/climbmix-10B-s1337
+```
+
+This writes `climbmix-10B-s1337-q8.bin` inside that checkpoint directory;
+`--force` is required to replace an existing file. GDN and MixerLoop use the
+same symmetric INT8 group-32 quantizer, with FP32 scales and side parameters.
+HF weights are not modified. The exporter verifies the complete GDNe v3
+roundtrip and reports tensor quantization error, size and SHA256. These errors
+are a sanity check, not a substitute for quantized model evaluation.
+
 ## CORE evaluation
 
 ```bash
@@ -141,10 +154,11 @@ Results record `Core_v2` and `eval_version`; no separate metadata download is ne
 
 ## Hardware and local artifacts
 
-`hardware/` preserves the earlier KV260 milestone; it does not yet implement
-the residual MixerLoop architecture or these canonical geometries.
-See `hardware/README.md` for the milestone implementation and toolchain.
-Training does not automatically produce compatible Q8 hardware weights.
+`hardware/` targets canonical 13m GDN/MixerLoop on KV260. It preserves the
+single-instance structural HLS architecture of the earlier 15M milestone.
+See `hardware/README.md` for validation status, the binary contract and the
+build/deployment workflow. Old 15M reports remain under `hardware/baselines/`;
+their throughput is not a result for the new model. Training exports HF only.
 
 Checkpoints, weights and logs stay local and are excluded from Git.
 Historical outputs are kept under `outputs/legacy/` on each machine.
@@ -158,7 +172,7 @@ configs/                 matched canonical configurations
 custom_models/mixerloop/ Transformers model implementation
 flame/                   training and checkpoint conversion
 eval/                    CORE and lm-eval entry points
-hardware/                earlier accelerator milestone
+hardware/                HF PTQ and canonical 13m KV260 accelerator
 tests/                   model, data, optimizer and export contracts
 outputs/legacy/          local historical artifacts (ignored)
 ```
