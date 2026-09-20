@@ -48,6 +48,8 @@ class MixerLoopPreTrainedModel(GatedDeltaNetPreTrainedModel):
 
 class MixerLoopModel(MixerLoopPreTrainedModel):
 
+    block_class = MixerLoopBlock
+
     def __init__(self, config: MixerLoopConfig):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
@@ -57,7 +59,7 @@ class MixerLoopModel(MixerLoopPreTrainedModel):
         norm_cls = RMSNorm if config.fuse_norm else nn.RMSNorm
         self.embeddings = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
-            MixerLoopBlock(config, i) for i in range(config.num_hidden_layers)
+            self.block_class(config, i) for i in range(config.num_hidden_layers)
         )
         self.norm = norm_cls(config.hidden_size, eps=config.norm_eps)
         self.residual_weight = nn.Parameter(
@@ -136,10 +138,11 @@ class MixerLoopModel(MixerLoopPreTrainedModel):
 class MixerLoopForCausalLM(MixerLoopPreTrainedModel, GenerationMixin):
 
     _tied_weights_keys = ['lm_head.weight']
+    model_class = MixerLoopModel
 
     def __init__(self, config: MixerLoopConfig):
         super().__init__(config)
-        self.model = MixerLoopModel(config)
+        self.model = self.model_class(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.criterion = None

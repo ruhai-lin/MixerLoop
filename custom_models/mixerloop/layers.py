@@ -31,8 +31,9 @@ class MixerLoopBlock(nn.Module):
             mode=config.attn_mode,
             use_gate=True,
             use_short_conv=True,
+            allow_neg_eigval=getattr(config, 'allow_neg_eigval', False),
             conv_size=config.conv_size,
-            norm_eps=config.norm_eps,
+            norm_eps=getattr(config, 'mixer_norm_eps', config.norm_eps),
             layer_idx=layer_idx,
         )
         self.ffn_norm = norm_cls(config.hidden_size, eps=config.norm_eps)

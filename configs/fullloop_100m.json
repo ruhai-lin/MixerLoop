@@ -1,0 +1,31 @@
+{
+  "architectures": [
+    "FullLoopForCausalLM"
+  ],
+  "attn_mode": "chunk",
+  "bos_token_id": 1,
+  "conv_size": 4,
+  "eos_token_id": 2,
+  "expand_v": 2,
+  "fuse_cross_entropy": true,
+  "fuse_linear_cross_entropy": false,
+  "fuse_norm": true,
+  "fuse_swiglu": true,
+  "hidden_act": "swish",
+  "hidden_ratio": 4,
+  "initializer_range": 0.036084391824351615,
+  "norm_eps": 0.00001,
+  "mixer_norm_eps": 0.00001,
+  "allow_neg_eigval": false,
+  "tie_word_embeddings": true,
+  "use_cache": false,
+  "head_dim": 64,
+  "hidden_size": 768,
+  "intermediate_size": 2112,
+  "max_position_embeddings": 1024,
+  "model_type": "fullloop",
+  "num_heads": 9,
+  "num_hidden_layers": 9,
+  "vocab_size": 32000,
+  "loop_count": 4
+}

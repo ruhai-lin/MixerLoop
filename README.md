@@ -13,10 +13,27 @@ for physical layer i:
     h = h + FFN_i(FFNNorm_i(h))
 ```
 
+FullLoop is the pure-GDN [LT2](https://github.com/chili-lab/LT2/tree/1ac9ed5c913d88623cca34da3658b57400079767)
+baseline. It repeats the **entire layer stack**, including each FFN, and adds
+one shared, zero-initialized per-dimension residual after each iteration:
+
+```text
+for t in range(T):
+    h_input = h
+    for physical layer i:
+        h = h + GDN_i(RMSNorm_i(h))
+        h = h + FFN_i(FFNNorm_i(h))
+    h = h + residual_weight[t] * h_input
+```
+
+Only the final iteration is normalized and scored by the tied LM head.
+Training/evaluation recompute the full prefix without a decode cache, as in LT2.
+
 ## Canonical configurations
 
 Each size has `configs/gdn_<size>.json` (FLA's native GDN) and
-`configs/mixerloop_<size>.json` (MixerLoop T=4). Both use tied embeddings,
+`configs/mixerloop_<size>.json` (MixerLoop T=4), plus
+`configs/fullloop_<size>.json` (FullLoop T=4). All use tied embeddings,
 short convolution size 4, and `expand_v=2`.
 
 | Size | Hidden | Layers | Heads | Key / value head dim | FFN | Vocabulary | Context |
@@ -33,6 +50,27 @@ recipe; supply that tokenizer explicitly.
 Names identify geometry presets. Instantiated GDN parameter counts are
 12,895,356 / 100,444,194 / 445,771,024 / 1,578,945,120 respectively.
 MixerLoop adds exactly `4 * hidden_size` shared residual parameters.
+FullLoop has the same parameter counts as MixerLoop:
+12,896,380 / 100,447,266 / 445,775,120 / 1,578,953,312.
+
+FullLoop uses LT2 initialization at **all four sizes**: linear/embedding weights
+are truncated normal with standard deviation `hidden_size ** -0.5`, cut off at
+three standard deviations, without depth/loop scaling. Convolutions retain their
+native reset; GDN `A_log`/`dt_bias` use their native initialization. Existing GDN
+and MixerLoop initialization is unchanged, so this baseline changes initialization
+as well as looping order.
+
+The FullLoop 600m preset follows LT2's
+[`looped_pure_gdn_600M.yaml`](https://github.com/chili-lab/LT2/blob/1ac9ed5c913d88623cca34da3658b57400079767/apps/LT2/configs/600M/looped_pure_gdn_600M.yaml):
+key width `0.75 * hidden_size`, value expansion 2, SwiGLU width rounded to 2,816,
+tied Llama 3 embeddings, context 4,096, outer norm epsilon `1e-6`, GDN gate norm
+epsilon `1e-5`, and `allow_neg_eigval=false`. The official "600M" geometry actually
+instantiates 445.8M parameters here; the name does not imply a 600M parameter count.
+FullLoop 1p6b follows the same revision's pure-GDN 1B preset, including its
+explicit `allow_neg_eigval=true`. These internal norm/eigenvalue settings are not
+silently applied to the existing GDN/MixerLoop presets.
+Model configuration alignment is not a claim of reproducing LT2's training recipe:
+the 13m/100m ClimbMix experiments retain this repository's optimizer and token budget.
 
 ## Environment
 
@@ -85,6 +123,9 @@ WANDB_PROJECT=mixerloop WANDB_NAME=fineweb13m_mixerloop_10b_s1337 NGPU=1 bash tr
 ```
 
 For matched GDN, select `configs/gdn_13m.json` and a separate output directory.
+For FullLoop, select `configs/fullloop_13m.json`; for example, use
+`outputs/fullloop-13m/climbmix-10B-s1337` and
+`WANDB_NAME=climbmix13m_fullloop_10b_s1337` for the corresponding ClimbMix run.
 Keep global batch, seed, data order, schedule and token budget matched.
 Larger recipes require their matching tokenizer/context.
 
@@ -170,6 +211,7 @@ Active isolated runs retain their existing source and output paths.
 assets/tokenizer/        Llama 2 tokenizer
 configs/                 matched canonical configurations
 custom_models/mixerloop/ Transformers model implementation
+custom_models/fullloop/  LT2-style whole-stack looping baseline
 flame/                   training and checkpoint conversion
 eval/                    CORE and lm-eval entry points
 hardware/                HF PTQ and canonical 13m KV260 accelerator

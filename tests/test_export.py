@@ -8,6 +8,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from fla.models.gated_deltanet.configuration_gated_deltanet import GatedDeltaNetConfig
 
 from custom_models.mixerloop import MixerLoopConfig
+from custom_models.fullloop import FullLoopConfig
 from flame.utils.convert_dcp_to_hf import save_pretrained
 from hardware.quantization import (
     HEADER, HEADER_BYTES, HEADER_FIELDS, classify, export_checkpoint,
@@ -15,7 +16,7 @@ from hardware.quantization import (
 )
 
 
-@pytest.mark.parametrize("config_class", [GatedDeltaNetConfig, MixerLoopConfig])
+@pytest.mark.parametrize("config_class", [GatedDeltaNetConfig, MixerLoopConfig, FullLoopConfig])
 def test_hf_export_roundtrip(tmp_path, config_class):
     config = config_class(
         hidden_size=32, num_hidden_layers=1, num_heads=1, head_dim=32,
