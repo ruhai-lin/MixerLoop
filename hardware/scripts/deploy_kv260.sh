@@ -23,7 +23,7 @@ printf -v remote_q '%q' "$REMOTE"
 printf -v remote_model_q '%q' "$REMOTE/model"
 
 ssh "$KV260" "rm -rf -- $remote_q && mkdir -p -- $remote_model_q"
-scp "$BUNDLE/gdn_host" "$BUNDLE/binary_container_1.bin" \
+scp "$BUNDLE/mixerloop_host" "$BUNDLE/binary_container_1.bin" \
     "$BUNDLE/pl.dtbo" "$BUNDLE/shell.json" "$KV260:$remote_q/"
 scp "$BUNDLE"/model/* "$KV260:$remote_model_q/"
 

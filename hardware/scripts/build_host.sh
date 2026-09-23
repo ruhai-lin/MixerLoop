@@ -32,7 +32,7 @@ aarch64-xilinx-linux-g++ -Wall -Wextra -std=c++2a -O2 \
   "$PROJECT/src/vocab.cpp" \
   -L"$SYSROOT/usr/lib" \
   -lxilinxopencl -lxrt_coreutil -lpthread -lrt -ldl \
-  -o "$PROJECT/outputs/host/gdn_host" \
+  -o "$PROJECT/outputs/host/mixerloop_host" \
   2>&1 | tee "$PROJECT/outputs/logs/host_build.log"
 
-echo "built: $PROJECT/outputs/host/gdn_host"
+echo "built: $PROJECT/outputs/host/mixerloop_host"

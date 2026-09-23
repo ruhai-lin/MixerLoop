@@ -16,8 +16,11 @@
 /runs/
 /build/
 /dist/
+/paper/
+/assets/tokenizer_llama3/
 
 /hardware/outputs/
+/experiments/outputs/
 /hardware/.Xil/
 /hardware/.ipcache/
 /hardware/analyzer_input/

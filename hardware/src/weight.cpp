@@ -164,7 +164,7 @@ void LoadWeights(Weights& w, const std::string& path) {
       h.head_v_dim != kHeadVDim || h.conv_size != kConvSize ||
       h.vocab_size != kVocabSize || h.shared_classifier != 1 ||
       h.group_size != kQuantGroupSize) {
-    throw std::runtime_error("checkpoint config does not match gdn.hls constants");
+    throw std::runtime_error("checkpoint config does not match the canonical hardware profile");
   }
   if (h.seq_len < 1 || h.seq_len > kSeqLen) {
     throw std::runtime_error("checkpoint seq_len exceeds the hardware profile");

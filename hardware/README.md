@@ -62,16 +62,16 @@ Run the CPU reference on the development machine to check model and tokenizer lo
 ```bash
 cmake -S hardware -B hardware/outputs/cpu
 cmake --build hardware/outputs/cpu -j
-hardware/outputs/cpu/gdn_host \
+hardware/outputs/cpu/mixerloop_host \
   --weight_path hardware/model/climbmix-10B-s1337-q8.bin \
   --vocab_path hardware/model/tokenizer.bin -i Once -n 32 -t 0
 ```
 
-The program prints generated text, the number of executed decode steps, and throughput. The CPU reference checks deployment numerics, but its floating-point reduction order differs from the FPGA and does not guarantee identical generation for every input. Board comparisons use kernel simulation linked against AMD math models; see the [validation record](TECHNICAL.md#validation-status).
+The program prints generated text, the number of executed decode steps, and throughput. The CPU reference and kernel simulation use the same packed weights and model geometry; FPGA and CPU reductions can differ in floating-point order.
 
 ## Build from source
 
-The following commands call HLS, the Vitis linker, and the cross-compiler directly. Generated files stay under the gitignored `hardware/outputs/` directory. HLS produces `decode.xo`; linking performs placement and routing and produces `binary_container_1.xclbin`; cross-compilation produces the board-side `gdn_host`.
+The following commands call HLS, the Vitis linker, and the cross-compiler directly. Generated files stay under the gitignored `hardware/outputs/` directory. HLS produces `decode.xo`; linking performs placement and routing and produces `binary_container_1.xclbin`; cross-compilation produces the board-side `mixerloop_host`.
 
 ### Synthesize the kernel
 
@@ -141,7 +141,7 @@ mkdir -p hardware/outputs/host
     hardware/src/main.cpp hardware/src/decode.cpp \
     hardware/src/weight.cpp hardware/src/vocab.cpp \
     -L"$SYSROOT/usr/lib" -lxilinxopencl -lxrt_coreutil -lpthread -lrt -ldl \
-    -o hardware/outputs/host/gdn_host
+    -o hardware/outputs/host/mixerloop_host
 )
 ```
 
@@ -151,7 +151,7 @@ Assemble the runtime directory on the development machine. `binary_container_1.b
 
 ```bash
 mkdir -p hardware/outputs/bundle/model
-cp hardware/outputs/host/gdn_host hardware/outputs/bundle/
+cp hardware/outputs/host/mixerloop_host hardware/outputs/bundle/
 cp hardware/outputs/link/binary_container_1.xclbin hardware/outputs/bundle/binary_container_1.bin
 cp "$PLATFORM_ROOT/sw/boot/pl.dtbo" hardware/outputs/bundle/
 cp hardware/model/climbmix-10B-s1337-q8.bin hardware/model/tokenizer.bin hardware/outputs/bundle/model/
@@ -172,8 +172,8 @@ sudo cp binary_container_1.bin pl.dtbo shell.json /lib/firmware/xilinx/mixerloop
 sudo xmutil unloadapp
 sudo xmutil loadapp mixerloop13m
 
-./gdn_host -i "Once upon a time" -n 128 -t 0
-./gdn_host -i "Once upon a time" -n 128 -t 0 --loop_count 1
+./mixerloop_host -i "Once upon a time" -n 128 -t 0
+./mixerloop_host -i "Once upon a time" -n 128 -t 0 --loop_count 1
 ```
 
 The first command uses T=4 from the checkpoint metadata; the second runs the same weights at T=1. Each invocation resets state. The FPGA uses greedy argmax. `-n` limits decode calls, including prompt tokens, and an end token may stop generation early. These short-prompt commands test generation; they are not the fixed-input throughput benchmark below.
@@ -194,7 +194,7 @@ The current 13M implementation completed placement and routing at 150 MHz on KV2
 | Median (tok/s) | 152.635 | 152.339 |
 | Relative to T=1 | 100% | 99.81% |
 
-The benchmark uses the same ClimbMix MixerLoop Q8 weights and a fixed long prefix, with 128 actual decode calls per run. Eight T=1/T=4 pairs alternate execution order; the first pair is discarded as warm-up, and each mode reports the median of the remaining seven runs. Timing includes per-token XRT calls and normal text output, but excludes model loading, parameter packing, and bitstream loading. The prefix covers all 128 inputs, so this measures token-by-token decode on fixed inputs, not 128 freely generated tokens. Commands and individual measurements are in the [throughput record](TECHNICAL.md#throughput-measurement).
+The benchmark uses the same ClimbMix MixerLoop Q8 weights and a fixed long prefix, with 128 decode calls per run. Eight T=1/T=4 pairs alternate execution order; the first pair is warm-up, and each mode reports the median of the remaining seven runs. Timing includes per-token XRT calls and normal text output. Model loading, parameter packing, and bitstream loading are outside the timed interval. The prefix supplies all 128 inputs, so the measurement covers token-by-token decode on fixed inputs.
 
 FFN weight transfers hide most of the three additional Mixer passes, but total latency is not exactly equal. RTL measurements give 8,920 cycles for a complete cached Mixer pass and 945,903 / 946,599 cycles for one complete T=1/T=4 token transaction including reset. Board throughput includes host overhead and is reported separately from RTL cycle ratios.
 
@@ -209,13 +209,13 @@ FFN weight transfers hide most of the three additional Mixer passes, but total l
 | Setup WNS / TNS | +0.250 ns / 0 ns |
 | Hold WHS / THS | +0.010 ns / 0 ns |
 
-Resource counts cover the full design, including platform logic, from Vitis / Vivado 2025.2 post-route reports rather than HLS estimates. The 162 BRAM18 equivalents comprise 77 RAMB36 and 8 RAMB18 blocks. State and scratch each use 32 of the 64 URAM blocks. WNS/WHS denote worst setup/hold slack; TNS/THS denote total negative slack. Report paths, artifact hashes, and validation scope are recorded in the [technical report](TECHNICAL.md).
+Resource counts cover the full design, including platform logic, from Vitis / Vivado 2025.2 post-route reports. The 162 BRAM18 equivalents comprise 77 RAMB36 and 8 RAMB18 blocks. State and scratch each use 32 of the 64 URAM blocks. WNS/WHS denote worst setup/hold slack; TNS/THS denote total negative slack.
 
 ## Code layout
 
 [decode.cpp](src/decode.cpp) implements the HLS kernel, fixed dataflow schedule, and CPU reference. [weight.cpp](src/weight.cpp) loads the model and packs device weights. [main.cpp](src/main.cpp) and [vocab.cpp](src/vocab.cpp) provide the host and tokenizer. [quantization.py](quantization.py) is the standalone local HF-to-Q8 exporter. [kernel_sim.cpp](tools/kernel_sim.cpp) checks token outputs, reset, and loop switching.
 
-See the [technical report](TECHNICAL.md) for the binary format, cache budget, numerical validation limits, and historical 15M baseline. Training and software evaluation follow the [main repository workflow](../README.md); hardware export leaves training checkpoints unchanged.
+Training and software evaluation follow the [main repository workflow](../README.md); hardware export leaves training checkpoints unchanged.
 
 ## References and acknowledgments
 

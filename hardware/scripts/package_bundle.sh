@@ -14,8 +14,8 @@ if [[ ! -f "$XCLBIN" ]]; then
   echo "missing xclbin: $XCLBIN (run scripts/build_link.sh first)" >&2
   exit 1
 fi
-if [[ ! -f "$PROJECT/outputs/host/gdn_host" ]]; then
-  echo "missing host: $PROJECT/outputs/host/gdn_host (run scripts/build_host.sh first)" >&2
+if [[ ! -f "$PROJECT/outputs/host/mixerloop_host" ]]; then
+  echo "missing host: $PROJECT/outputs/host/mixerloop_host (run scripts/build_host.sh first)" >&2
   exit 1
 fi
 if [[ ! -f "$TOKENIZER_PATH" ]]; then
@@ -34,7 +34,7 @@ fi
 rm -rf -- "$BUNDLE"
 mkdir -p "$BUNDLE/model"
 
-cp -f "$PROJECT/outputs/host/gdn_host" "$BUNDLE/gdn_host"
+cp -f "$PROJECT/outputs/host/mixerloop_host" "$BUNDLE/mixerloop_host"
 cp -f "$XCLBIN" "$BUNDLE/binary_container_1.bin"
 cp -f "$TOKENIZER_PATH" "$BUNDLE/model/tokenizer.bin"
 cp -f "$WEIGHT_PATH" "$BUNDLE/model/"
@@ -53,6 +53,6 @@ cat > "$BUNDLE/shell.json" <<'JSON'
 }
 JSON
 
-chmod +x "$BUNDLE/gdn_host"
+chmod +x "$BUNDLE/mixerloop_host"
 echo "bundle ready: $BUNDLE"
 ls -l "$BUNDLE" "$BUNDLE/model"

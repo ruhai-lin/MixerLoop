@@ -7,10 +7,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 add_compile_options(-Wall -Wextra -Wno-unknown-pragmas -mcmodel=large)
 add_compile_definitions(USE_CPU_ONLY)
 
-add_executable(gdn_host
+add_executable(mixerloop_host
   src/decode.cpp
   src/main.cpp
   src/vocab.cpp
   src/weight.cpp
 )
-target_include_directories(gdn_host PRIVATE src)
+target_include_directories(mixerloop_host PRIVATE src)

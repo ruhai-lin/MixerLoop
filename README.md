@@ -197,8 +197,8 @@ Results record `Core_v2` and `eval_version`; no separate metadata download is ne
 
 `hardware/` targets canonical 13m GDN/MixerLoop on KV260. It preserves the
 single-instance structural HLS architecture of the earlier 15M milestone.
-See `hardware/README.md` for validation status, the binary contract and the
-build/deployment workflow. Old 15M reports remain under `hardware/baselines/`;
+See `hardware/README.md` for model downloads, build/deployment commands and
+board results. Old 15M reports remain under `hardware/baselines/`;
 their throughput is not a result for the new model. Training exports HF only.
 
 Checkpoints, weights and logs stay local and are excluded from Git.
