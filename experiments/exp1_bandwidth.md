@@ -26,6 +26,8 @@ Extra Mixer work is hidden at the one-port point and becomes visible as bandwidt
 
 These are medians of seven retained rounds after one warm-up pair, using the same models and 128-call prefix as the [release comparison](../hardware/README.md#performance-and-resources). Both models' 128 predicted tokens match across all three experimental images and the restored release image. For each experimental image, the full eight-pair run reads exactly 29,921,083,392 bytes. Per-token bytes observed on DDR slots 3/4/5 are respectively `14609904/0/0` (1 HP), `7374832/0/7235072` (2 HP), and `3757296/7235072/3617536` (4 HP), matching the intended striping. Idle traffic on these slots was zero. Linux used XRT 2.13.0 and the CPU remained at 1.333 GHz with the userspace governor. No DDR clock or QoS setting was changed between points.
 
+The figure uses nominal port bandwidth (2.4, 4.8, and 9.6 GB/s) on the x-axis and measured throughput on the y-axis. Sustained streaming bandwidth is reported below.
+
 ### Streaming bandwidth calibration
 
 The existing LM-head loop consumes one packed word per cycle without downstream stream backpressure. Its steady interior separates sustained parameter supply from complete-decoder compute gaps, using the same images and memory path.
