@@ -9,6 +9,7 @@ Reproducible analyses and figures for the paper. Contributors and agents should 
 | 1: Bandwidth | When does extra recurrent compute become visible in decode throughput? | [exp1_bandwidth.py](exp1_bandwidth.py) | [exp1_bandwidth.md](exp1_bandwidth.md) |
 | 2: Memory wall | How do active FFN traffic and mixer compute differ across architectures? | [exp2_memory_wall.py](exp2_memory_wall.py) | [exp2_memory_wall.md](exp2_memory_wall.md) |
 | 3: Language modeling | How do the training-loss trajectories compare across model variants? | [exp3_language_modeling.py](exp3_language_modeling.py) | [exp3_language_modeling.md](exp3_language_modeling.md) |
+| 4: Mechanism diagnostics | How do repeated mixer updates change quality and FFN-input representations? | [exp4_mechanism_diagnostics.py](exp4_mechanism_diagnostics.py) | [exp4_mechanism_diagnostics.md](exp4_mechanism_diagnostics.md) |
 
 Use Python with NumPy and Matplotlib. Run from the repository root:
 
@@ -16,6 +17,7 @@ Use Python with NumPy and Matplotlib. Run from the repository root:
 python3 experiments/exp1_bandwidth.py
 python3 experiments/exp2_memory_wall.py
 python3 experiments/exp3_language_modeling.py
+python3 experiments/exp4_mechanism_diagnostics.py
 ```
 
 The scripts run offline and resolve paths relative to `Path(__file__).resolve().parent`.
@@ -31,9 +33,17 @@ experiments/
 ├── exp2_memory_wall.md
 ├── exp3_language_modeling.py
 ├── exp3_language_modeling.md
+├── exp4_mechanism_diagnostics.py
+├── exp4_mechanism_diagnostics.md
 ├── data/                       # Version-controlled inputs
 │   ├── exp1_bandwidth.csv
-│   └── exp3_loss.csv
+│   ├── exp3_loss.csv
+│   └── exp4_mechanism/         # Compact four-pair mechanism inputs
+│       ├── quality.csv
+│       ├── comparisons.csv
+│       ├── performance_link.csv
+│       ├── a4_rank_differences.csv
+│       └── a5_ffn_input_differences.csv
 └── outputs/                    # Generated files; ignored by Git
     ├── exp1_bandwidth.pdf
     ├── exp1_bandwidth.png

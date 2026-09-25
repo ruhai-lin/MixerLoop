@@ -1,0 +1,17 @@
+pair,role,model,scale,pass,position_name,split,baseline_model,baseline_pass,metric,delta
+100m/climbmix-10B-s1337,mid,mixerloop,100m/climbmix-10B-s1337,4,ffn_input,validation,mixerloop,1,top_10pct_energy,-0.0025273367878871356
+100m/climbmix-10B-s1337,mid,mixerloop,100m/climbmix-10B-s1337,4,ffn_input,validation,mixerloop,1,mean_pair_cosine,-0.002360850394937157
+100m/climbmix-10B-s1337,end,mixerloop,100m/climbmix-10B-s1337,4,ffn_input,validation,mixerloop,1,top_10pct_energy,0.04924455753431989
+100m/climbmix-10B-s1337,end,mixerloop,100m/climbmix-10B-s1337,4,ffn_input,validation,mixerloop,1,mean_pair_cosine,0.06590537316709272
+13m/climbmix-10B-s1337,mid,mixerloop,13m/climbmix-10B-s1337,4,ffn_input,validation,mixerloop,1,top_10pct_energy,0.001835429852778847
+13m/climbmix-10B-s1337,mid,mixerloop,13m/climbmix-10B-s1337,4,ffn_input,validation,mixerloop,1,mean_pair_cosine,-0.004617316413114095
+13m/climbmix-10B-s1337,end,mixerloop,13m/climbmix-10B-s1337,4,ffn_input,validation,mixerloop,1,top_10pct_energy,0.12697930157439363
+13m/climbmix-10B-s1337,end,mixerloop,13m/climbmix-10B-s1337,4,ffn_input,validation,mixerloop,1,mean_pair_cosine,0.21781224888451564
+13m/climbmix-10B-s2026,mid,mixerloop,13m/climbmix-10B-s2026,4,ffn_input,validation,mixerloop,1,top_10pct_energy,0.012647864946864762
+13m/climbmix-10B-s2026,mid,mixerloop,13m/climbmix-10B-s2026,4,ffn_input,validation,mixerloop,1,mean_pair_cosine,0.019874121907665937
+13m/climbmix-10B-s2026,end,mixerloop,13m/climbmix-10B-s2026,4,ffn_input,validation,mixerloop,1,top_10pct_energy,0.07570320842092138
+13m/climbmix-10B-s2026,end,mixerloop,13m/climbmix-10B-s2026,4,ffn_input,validation,mixerloop,1,mean_pair_cosine,0.14379976219604312
+13m/climbmix-10B-s42,mid,mixerloop,13m/climbmix-10B-s42,4,ffn_input,validation,mixerloop,1,top_10pct_energy,0.005417355246976396
+13m/climbmix-10B-s42,mid,mixerloop,13m/climbmix-10B-s42,4,ffn_input,validation,mixerloop,1,mean_pair_cosine,0.008670533473049524
+13m/climbmix-10B-s42,end,mixerloop,13m/climbmix-10B-s42,4,ffn_input,validation,mixerloop,1,top_10pct_energy,0.0841840650846355
+13m/climbmix-10B-s42,end,mixerloop,13m/climbmix-10B-s42,4,ffn_input,validation,mixerloop,1,mean_pair_cosine,0.17059024548476684
