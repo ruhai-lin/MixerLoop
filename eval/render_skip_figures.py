@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import hashlib
 import json
 import math
 from pathlib import Path
@@ -171,7 +170,6 @@ def render_skip_figures(
             raise ValueError("formal figure contract requires six mITR/delta-loss scatters")
     manifest = {
         "source_csv": str(skip_csv),
-        "source_sha256": hashlib.sha256(skip_csv.read_bytes()).hexdigest(),
         "renderer": "Pillow",
         "formal_six_checkpoints": expected_checkpoints is not None,
         "generated": generated,

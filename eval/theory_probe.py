@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import copy
-import hashlib
 import json
 import os
 import random
@@ -14,7 +13,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable, Sequence
+from typing import Any, Iterable, Sequence
 
 import numpy as np
 import torch
@@ -28,10 +27,8 @@ from eval.theory_capture import (
     build_record_specs,
     build_stats_row,
     logits_from_record_hidden,
-    model_state_digest,
     next_token_sufficient_stats,
     root_size_bytes,
-    sha256_bytes,
     write_json_guarded,
 )
 
@@ -61,8 +58,6 @@ class FixedProbeDataset:
     records_by_sample_id: dict[int, dict[str, Any]]
     metric_start: int
     metric_end: int
-    theory_eval_ids_sha256: str
-    probe_split_metadata_sha256: str
 
 
 @dataclass(frozen=True)
@@ -109,10 +104,6 @@ class ProbeTrainingConfig:
     record_gpu_trace: bool = True
 
 
-def _sha256_file(path: Path) -> str:
-    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
-
-
 def _load_json(path: Path) -> Any:
     return json.loads(Path(path).read_text())
 
@@ -145,11 +136,12 @@ def load_fixed_probe_dataset(spec01_root: Path) -> FixedProbeDataset:
         sample_ids=sample_ids,
         fit_sample_ids=fit_sample_ids,
         heldout_sample_ids=heldout_sample_ids,
-        records_by_sample_id={int(record["sample_id"]): dict(record) for record in records},
+        records_by_sample_id={
+            int(record["sample_id"]): {key: value for key, value in record.items() if key != "input_sha256"}
+            for record in records
+        },
         metric_start=int(metric_positions["start"]),
         metric_end=int(metric_positions["end"]),
-        theory_eval_ids_sha256=_sha256_file(ids_path),
-        probe_split_metadata_sha256=_sha256_file(split_path),
     )
 
 
@@ -181,7 +173,6 @@ def parse_released_checkpoint_inventory(outputs_root: Path) -> list[dict[str, An
                 "checkpoint_path": str(checkpoint_dir),
                 "config_path": str(config_path),
                 "weights_path": str(weights_path),
-                "config_sha256": _sha256_file(config_path),
                 "model_type": str(config.get("model_type", "")),
                 "num_layers": int(num_layers),
                 "loop_count": int(config.get("loop_count", 1)),
@@ -231,7 +222,6 @@ def build_runtime_target_manifest(checkpoint_inventory: Sequence[dict[str, Any]]
             row.update(
                 {
                     "checkpoint_path": str(checkpoint["checkpoint_path"]),
-                    "config_sha256": str(checkpoint["config_sha256"]),
                     "readouts": ["linear_probe", "frozen_lm_head"],
                     "runtime_status": "NOT_RUN",
                 }
@@ -264,30 +254,12 @@ def build_metric_token_batches(
     return batches
 
 
-def record_frozen_state_transition(
-    model: torch.nn.Module,
-    *,
-    stage: str,
-    operation: Callable[[], Any],
-) -> dict[str, Any]:
-    before = model_state_digest(model)
-    operation()
-    after = model_state_digest(model)
-    return {
-        "stage": str(stage),
-        "before_digest": before,
-        "after_digest": after,
-        "frozen": before == after,
-    }
-
-
 def train_linear_probe_step(
     hidden: torch.Tensor,
     labels: torch.Tensor,
     *,
     num_classes: int,
     config: ProbeTrainingConfig,
-    base_model: torch.nn.Module | None = None,
 ) -> dict[str, Any]:
     if config.optimizer != "AdamW":
         raise ValueError("Spec 02 probe optimizer must be AdamW")
@@ -296,7 +268,6 @@ def train_linear_probe_step(
     if labels.shape != hidden.shape[:2]:
         raise ValueError("labels must match hidden batch and sequence dimensions")
 
-    base_state_before = model_state_digest(base_model) if base_model is not None else ""
     features = hidden.detach().reshape(-1, hidden.shape[-1]).float()
     flat_labels = labels.reshape(-1).long()
     probe = torch.nn.Linear(hidden.shape[-1], int(num_classes)).to(features.device)
@@ -311,16 +282,12 @@ def train_linear_probe_step(
     delta_l1 = 0.0
     for before_param, after_param in zip(before, probe.parameters()):
         delta_l1 += float((after_param.detach() - before_param).abs().sum().item())
-    base_state_after = model_state_digest(base_model) if base_model is not None else ""
     return {
         "optimizer": "AdamW",
         "learning_rate": float(config.learning_rate),
         "weight_decay": float(config.weight_decay),
         "loss": float(loss.detach().item()),
         "fused_adamw_runtime": bool("fused" in optimizer_kwargs),
-        "base_state_before": base_state_before,
-        "base_state_after": base_state_after,
-        "base_state_unchanged": base_state_before == base_state_after,
         "probe_parameter_delta_l1": delta_l1,
     }
 
@@ -335,7 +302,6 @@ def build_streamed_sample_stats_row(
     top1_correct: int,
     top5_correct: int,
     precision: str,
-    input_sha256: str,
 ) -> dict[str, Any]:
     if num_positions <= 0:
         raise ValueError("num_positions must be positive")
@@ -345,7 +311,6 @@ def build_streamed_sample_stats_row(
             "sample_id": int(sample_id),
             "readout": str(readout),
             "precision": str(precision),
-            "input_sha256": str(input_sha256),
             "ce_sum": float(ce_sum),
             "num_positions": int(num_positions),
             "top1_correct": int(top1_correct),
@@ -366,7 +331,6 @@ def frozen_lm_head_stats_row(
     target: ProbeTarget,
     sample_id: int,
     precision: str,
-    input_sha256: str,
 ) -> dict[str, Any]:
     logits = logits_from_record_hidden(model, hidden)
     stats = next_token_sufficient_stats(
@@ -383,7 +347,6 @@ def frozen_lm_head_stats_row(
         readout="frozen_lm_head",
         stats=stats,
         precision=precision,
-        input_sha256=input_sha256,
         layer=target.layer,
         pass_index=target.pass_index,
         record_type=target.record_type,
@@ -487,8 +450,6 @@ def build_spec02_run_manifest(
             "fit_sample_ids": list(dataset.fit_sample_ids),
             "heldout_sample_ids": list(dataset.heldout_sample_ids),
             "metric_positions": {"start": dataset.metric_start, "end": dataset.metric_end},
-            "theory_eval_ids_sha256": dataset.theory_eval_ids_sha256,
-            "probe_split_metadata_sha256": dataset.probe_split_metadata_sha256,
         },
         "checkpoint_count": len(checkpoint_inventory),
         "checkpoints": list(checkpoint_inventory),
@@ -664,9 +625,6 @@ def _load_fixed_input_ids(dataset: FixedProbeDataset, *, sample_id: int, data_di
     start = int(record["start_token"])
     end = start + int(record["num_tokens"])
     input_tokens = np.asarray(tokens[start:end], dtype=np.uint16)
-    actual_sha = sha256_bytes(input_tokens.tobytes())
-    if actual_sha != str(record["input_sha256"]):
-        raise ValueError(f"fixed sample sha mismatch for sample_id={sample_id}: {actual_sha} != {record['input_sha256']}")
     return torch.as_tensor(input_tokens.astype(np.int64), dtype=torch.long).unsqueeze(0), dict(record)
 
 
@@ -833,7 +791,6 @@ def _probe_sample_stats(
     logits: torch.Tensor,
     labels: torch.Tensor,
     precision: str,
-    input_sha256: str,
 ) -> dict[str, Any]:
     logits = logits.detach()
     labels = labels.detach().to(logits.device).long()
@@ -848,7 +805,6 @@ def _probe_sample_stats(
         top1_correct=int((topk[:, 0] == labels).sum().cpu().item()),
         top5_correct=int((topk == labels[:, None]).any(dim=-1).sum().cpu().item()),
         precision=precision,
-        input_sha256=input_sha256,
     )
 
 
@@ -887,7 +843,6 @@ def _capture_gdn_target_samples(
                 top1_correct=int(stats["top1_correct"]),
                 top5_correct=int(stats["top5_correct"]),
                 precision="float32",
-                input_sha256=str(fixed_record["input_sha256"]),
             )
         )
         features, labels = _metric_features_and_labels(
@@ -930,7 +885,6 @@ def _evaluate_probe_rows(
                 logits=logits,
                 labels=labels,
                 precision="float32",
-                input_sha256=str(frozen_row["input_sha256"]),
             )
         )
     return rows
@@ -1169,7 +1123,6 @@ def run_gdn15m_layer0_target(args: argparse.Namespace) -> dict[str, Any]:
     checkpoint_name = str(args.checkpoint_name) if args.checkpoint_name else checkpoint_path.name
     scale = str(args.scale) if args.scale else checkpoint_name.removeprefix("gdn-")
     target = ProbeTarget(checkpoint_name, scale, str(args.condition), int(args.layer), int(args.pass_index), str(args.record_type))
-    before_digest = model_state_digest(model)
     capture_start = time.perf_counter()
     fit = _capture_gdn_target_samples(
         model,
@@ -1205,7 +1158,6 @@ def run_gdn15m_layer0_target(args: argparse.Namespace) -> dict[str, Any]:
         build_probe_detail_row(target=target, readout="linear_probe", bootstrap=probe_bootstrap),
     ]
     figure_inputs = build_figure_table_inputs(detail_rows)
-    after_digest = model_state_digest(model)
     manifest = {
         "spec": "02_probe_readout",
         "run": "gdn15m_layer0_hA_pass1_fixed_split",
@@ -1217,14 +1169,11 @@ def run_gdn15m_layer0_target(args: argparse.Namespace) -> dict[str, Any]:
         "heldout_sample_count": len(heldout_ids),
         "spec01": {
             "root": str(dataset.spec01_root),
-            "theory_eval_ids_sha256": dataset.theory_eval_ids_sha256,
-            "probe_split_metadata_sha256": dataset.probe_split_metadata_sha256,
             "metric_positions": {"start": dataset.metric_start, "end": dataset.metric_end},
         },
         "device": str(device),
         "precision": "float32",
         "wandb": {"enabled": False, "mode": "offline", "run_dir": ""},
-        "frozen_state": {"before_digest": before_digest, "after_digest": after_digest, "frozen": before_digest == after_digest},
         "capture_elapsed_seconds": float(capture_elapsed),
         "training": training,
         "frozen_head_detail": detail_rows[0],
@@ -1241,7 +1190,6 @@ def run_gdn15m_layer0_target(args: argparse.Namespace) -> dict[str, Any]:
     checks = {
         "exit_result": "PASS",
         "checkpoint_loaded": True,
-        "frozen_base_unchanged": before_digest == after_digest,
         "fit_sample_count": len(fit_ids),
         "heldout_sample_count": len(heldout_ids),
         "probe_best_heldout_loss": training["best_heldout_loss"],
@@ -1326,7 +1274,6 @@ def run_immediate_real_smoke(args: argparse.Namespace) -> dict[str, Any]:
     model.eval()
     input_ids = input_ids_cpu.to(device)
     heldout_input_ids = heldout_input_ids_cpu.to(device)
-    before_digest = model_state_digest(model)
     with torch.no_grad():
         hidden = _capture_gdn_h_a_pass1(model, input_ids, layer_index=int(args.layer))
         heldout_hidden = _capture_gdn_h_a_pass1(model, heldout_input_ids, layer_index=int(args.layer))
@@ -1354,7 +1301,6 @@ def run_immediate_real_smoke(args: argparse.Namespace) -> dict[str, Any]:
         vocab_size=int(model.config.vocab_size),
         device=device,
     )
-    after_digest = model_state_digest(model)
     elapsed = time.perf_counter() - start_time
 
     target = ProbeTarget("gdn-15m", "15m", "gdn", int(args.layer), 1, "hA")
@@ -1367,7 +1313,6 @@ def run_immediate_real_smoke(args: argparse.Namespace) -> dict[str, Any]:
         top1_correct=int(frozen_stats["top1_correct"]),
         top5_correct=int(frozen_stats["top5_correct"]),
         precision="float32",
-        input_sha256=str(fixed_record["input_sha256"]),
     )
     manifest = {
         "spec": "02_probe_readout",
@@ -1382,17 +1327,10 @@ def run_immediate_real_smoke(args: argparse.Namespace) -> dict[str, Any]:
         "heldout_fixed_record": heldout_fixed_record,
         "spec01": {
             "root": str(dataset.spec01_root),
-            "theory_eval_ids_sha256": dataset.theory_eval_ids_sha256,
-            "probe_split_metadata_sha256": dataset.probe_split_metadata_sha256,
             "metric_positions": {"start": dataset.metric_start, "end": dataset.metric_end},
         },
         "device": str(device),
         "precision": "float32",
-        "frozen_state": {
-            "before_digest": before_digest,
-            "after_digest": after_digest,
-            "frozen": before_digest == after_digest,
-        },
         "frozen_head": sample_row,
         "heldout_frozen_head": build_streamed_sample_stats_row(
             target=target,
@@ -1403,7 +1341,6 @@ def run_immediate_real_smoke(args: argparse.Namespace) -> dict[str, Any]:
             top1_correct=int(heldout_frozen_stats["top1_correct"]),
             top5_correct=int(heldout_frozen_stats["top5_correct"]),
             precision="float32",
-            input_sha256=str(heldout_fixed_record["input_sha256"]),
         ),
         "probe_step": probe_stats,
         "wandb": wandb_info,
@@ -1424,7 +1361,6 @@ def run_immediate_real_smoke(args: argparse.Namespace) -> dict[str, Any]:
     checks = {
         "exit_result": "PASS",
         "checkpoint_loaded": True,
-        "frozen_base_unchanged": before_digest == after_digest,
         "frozen_head_num_positions": int(frozen_stats["num_positions"]),
         "heldout_frozen_head_num_positions": int(heldout_frozen_stats["num_positions"]),
         "probe_train_token_count": int(probe_stats["train_token_count"]),

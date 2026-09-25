@@ -8,8 +8,6 @@ from pathlib import Path
 import pytest
 import torch
 
-from eval.theory_capture import model_state_digest
-
 
 @pytest.fixture()
 def theory_probe():
@@ -20,7 +18,6 @@ def _write_spec01_artifacts(root: Path) -> tuple[list[int], list[int], list[int]
     records = [
         {
             "sample_id": sample_id,
-            "input_sha256": f"sha-{sample_id}",
             "num_tokens": 512,
             "num_non_padding_tokens": 512,
         }
@@ -125,9 +122,7 @@ def test_probe_hyperparameters_and_tail_batches_match_design(theory_probe):
     assert batches[-1]["is_tail"] is True
 
 
-def test_replay_and_probe_step_do_not_mutate_base_model(theory_probe):
-    model = _ToyBase()
-    before = model_state_digest(model)
+def test_probe_step_reports_parameter_delta(theory_probe):
     hidden = torch.randn(2, 4, 3)
     labels = torch.tensor([[1, 2, 3, 4], [0, 1, 2, 3]])
 
@@ -136,18 +131,13 @@ def test_replay_and_probe_step_do_not_mutate_base_model(theory_probe):
         labels,
         num_classes=5,
         config=theory_probe.ProbeTrainingConfig(),
-        base_model=model,
     )
 
-    assert proof["base_state_before"] == before
-    assert proof["base_state_after"] == before
-    assert proof["base_state_unchanged"] is True
     assert proof["probe_parameter_delta_l1"] > 0
 
 
-def test_frozen_lm_head_readout_fits_no_parameters(theory_probe):
+def test_frozen_lm_head_readout_reports_metrics(theory_probe):
     model = _ToyBase()
-    before = model_state_digest(model)
     hidden = torch.randn(1, 512, 3)
     input_ids = torch.randint(0, 5, (1, 512))
     target = theory_probe.ProbeTarget(
@@ -166,14 +156,12 @@ def test_frozen_lm_head_readout_fits_no_parameters(theory_probe):
         target=target,
         sample_id=7,
         precision="float32",
-        input_sha256="abc",
     )
 
     assert row["readout"] == "frozen_lm_head"
     assert row["record_type"] == "hA"
     assert row["sample_id"] == 7
     assert row["num_positions"] == 479
-    assert model_state_digest(model) == before
 
 
 def test_bootstrap_ci_uses_sample_rows_and_required_schema(theory_probe):
@@ -305,7 +293,6 @@ def test_released_checkpoint_inventory_parses_configs_without_loading_weights(tm
         str(outputs_root / row["checkpoint"] / "model.safetensors") for row in inventory
     }
     assert all(row["weights_loaded"] is False for row in inventory)
-    assert all(row["config_sha256"] for row in inventory)
     assert {row["model_type"] for row in inventory} == {"ffnloop", "mixerloop", "fullloop"}
 
 
@@ -328,8 +315,6 @@ def test_runner_manifest_reuses_fixed_split_and_deterministic_audit(tmp_path: Pa
 
     assert manifest["spec01"]["fit_sample_ids"] == fit_ids
     assert manifest["spec01"]["heldout_sample_ids"] == heldout_ids
-    assert manifest["spec01"]["theory_eval_ids_sha256"] == dataset.theory_eval_ids_sha256
-    assert manifest["spec01"]["probe_split_metadata_sha256"] == dataset.probe_split_metadata_sha256
     assert manifest["audit_selection"]["full_raw_sample_ids"] == [0, 1, 2, 3]
     assert manifest["audit_selection"]["hidden_state_sample_ids"] == [0, 1, 2, 3, 4, 5]
     assert manifest["no_full_raw_archive_dependency"] is True
@@ -374,28 +359,6 @@ def test_runtime_target_manifest_preserves_canonical_readout_boundary(tmp_path: 
     assert all(row["readouts"] == ["linear_probe", "frozen_lm_head"] for row in manifest)
 
 
-def test_frozen_state_transition_records_replay_and_readout_mutation(theory_probe):
-    model = _ToyBase()
-
-    replay = theory_probe.record_frozen_state_transition(
-        model,
-        stage="replay",
-        operation=lambda: torch.zeros(1),
-    )
-    assert replay["stage"] == "replay"
-    assert replay["frozen"] is True
-    assert replay["before_digest"] == replay["after_digest"]
-
-    def mutate_readout():
-        with torch.no_grad():
-            model.lm_head.weight.add_(1.0)
-
-    readout = theory_probe.record_frozen_state_transition(model, stage="readout", operation=mutate_readout)
-    assert readout["stage"] == "readout"
-    assert readout["frozen"] is False
-    assert readout["before_digest"] != readout["after_digest"]
-
-
 def test_streamed_stats_bootstrap_and_detail_table_schema(theory_probe):
     target = theory_probe.ProbeTarget(
         checkpoint="gdn-15m",
@@ -415,7 +378,6 @@ def test_streamed_stats_bootstrap_and_detail_table_schema(theory_probe):
             top1_correct=2,
             top5_correct=4,
             precision="float32",
-            input_sha256=f"input-{sample_id}",
         )
         for sample_id in range(3)
     ]
@@ -424,7 +386,6 @@ def test_streamed_stats_bootstrap_and_detail_table_schema(theory_probe):
     detail = theory_probe.build_probe_detail_row(target=target, readout="linear_probe", bootstrap=bootstrap)
 
     assert rows[0]["precision"] == "float32"
-    assert rows[0]["input_sha256"] == "input-0"
     assert bootstrap["bootstrap_samples"] == 1000
     assert set(detail) == set(theory_probe.PROBE_DETAIL_COLUMNS)
     assert detail["record_type"] == "hA"

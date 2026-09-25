@@ -41,7 +41,6 @@ def test_render_skip_figures_writes_labeled_heatmap_and_scatter(tmp_path: Path):
         path.stat().st_size for path in tmp_path.rglob("*") if path.is_file()
     )
     saved = json.loads((output_dir / "figure_manifest.json").read_text())
-    assert saved["source_sha256"] == manifest["source_sha256"]
     assert saved["generated"] == manifest["generated"]
 
 

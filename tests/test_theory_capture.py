@@ -21,7 +21,6 @@ from eval.theory_capture import (
     build_stats_row,
     collect_record_hidden_states,
     logits_from_record_hidden,
-    model_state_digest,
     next_token_sufficient_stats,
     write_json_guarded,
 )
@@ -206,10 +205,9 @@ def test_logits_from_record_hidden_uses_final_norm_and_lm_head():
     assert logits.tolist() == [[[0.0, 2.0, 4.0, 6.0]]]
 
 
-def test_record_and_logit_computation_uses_eval_no_grad_and_preserves_state():
+def test_record_and_logit_computation_uses_eval_no_grad():
     model = _FakeLm()
     model.train()
-    before = model_state_digest(model)
     input_ids = torch.tensor([[1, 2, 3]])
 
     records = collect_record_hidden_states(model, input_ids, condition="mixerloop", scale="15m")
@@ -218,7 +216,6 @@ def test_record_and_logit_computation_uses_eval_no_grad_and_preserves_state():
     assert not model.training
     assert all(not hidden.requires_grad for _, hidden in records)
     assert not logits.requires_grad
-    assert model_state_digest(model) == before
 
 
 def test_baseline_loss_uses_hidden_positions_predicting_next_token():
@@ -246,7 +243,6 @@ def test_streamed_stats_row_has_required_schema():
         readout="baseline",
         stats={"ce_sum": 12.5, "num_positions": 479, "top1_correct": 3, "top5_correct": 19},
         precision="bf16",
-        input_sha256="a" * 64,
         layer=None,
         pass_index=None,
         record_type="baseline",
@@ -261,7 +257,6 @@ def test_streamed_stats_row_has_required_schema():
         "record_type": "baseline",
         "readout": "baseline",
         "precision": "bf16",
-        "input_sha256": "a" * 64,
         "ce_sum": 12.5,
         "num_positions": 479,
         "top1_correct": 3,

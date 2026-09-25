@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import hashlib
 import json
 import random
 from dataclasses import dataclass
@@ -109,10 +108,6 @@ def write_json_guarded(path: Path, payload: Any, *, output_root: Path, cap_bytes
     write_bytes_guarded(path, _json_bytes(payload), output_root=output_root, cap_bytes=cap_bytes)
 
 
-def sha256_bytes(payload: bytes) -> str:
-    return hashlib.sha256(payload).hexdigest()
-
-
 def validation_bin_path(data_dir: Path) -> Path:
     return Path(data_dir) / VALIDATION_FILE
 
@@ -160,7 +155,6 @@ def build_fixed_sample_artifacts(
                 "start_token": int(start),
                 "num_tokens": int(seq_len),
                 "num_non_padding_tokens": int(np.count_nonzero(input_tokens)),
-                "input_sha256": sha256_bytes(input_tokens.tobytes()),
             }
         )
 
@@ -258,16 +252,6 @@ def _loop_count(model: torch.nn.Module) -> int:
     if value is None and hasattr(model, "config"):
         value = getattr(model.config, "loop_count", None)
     return int(value or 1)
-
-
-def model_state_digest(model: torch.nn.Module) -> str:
-    digest = hashlib.sha256()
-    for name, tensor in sorted(model.state_dict().items()):
-        digest.update(name.encode("utf-8"))
-        digest.update(str(tuple(tensor.shape)).encode("ascii"))
-        digest.update(str(tensor.dtype).encode("ascii"))
-        digest.update(tensor.detach().cpu().contiguous().numpy().tobytes())
-    return digest.hexdigest()
 
 
 def _mixerloop_records(
@@ -444,7 +428,6 @@ def build_stats_row(
     readout: str,
     stats: dict[str, Any],
     precision: str,
-    input_sha256: str,
     layer: int | None,
     pass_index: int | None,
     record_type: str,
@@ -459,7 +442,6 @@ def build_stats_row(
         "record_type": record_type,
         "readout": readout,
         "precision": precision,
-        "input_sha256": input_sha256,
         "ce_sum": float(stats["ce_sum"]),
         "num_positions": int(stats["num_positions"]),
         "top1_correct": int(stats["top1_correct"]),

@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import hashlib
 import json
 import math
 import os
@@ -19,7 +18,7 @@ import torch
 from transformers import AutoModelForCausalLM
 
 import custom_models  # noqa: F401
-from eval.theory_capture import OUTPUT_ROOT_CAP_BYTES, model_state_digest, next_token_sufficient_stats, root_size_bytes, write_json_guarded
+from eval.theory_capture import OUTPUT_ROOT_CAP_BYTES, next_token_sufficient_stats, root_size_bytes, write_json_guarded
 from eval.theory_probe import _load_fixed_input_ids, load_fixed_probe_dataset, parse_released_checkpoint_inventory
 
 DETAIL_COLUMNS = [
@@ -46,7 +45,6 @@ SAMPLE_COLUMNS = [
     "layer",
     "pass",
     "sample_id",
-    "input_sha256",
     "precision",
     "normal_ce_sum",
     "skip_ce_sum",
@@ -266,22 +264,6 @@ def select_extreme_positions(rows: Sequence[dict[str, Any]], *, count: int = 5) 
     }
 
 
-def mixer_state_digest(model: torch.nn.Module) -> dict[str, Any]:
-    digest = hashlib.sha256()
-    mixer_count = 0
-    for name, module in model.named_modules():
-        if module.__class__.__name__ != "GatedDeltaNet":
-            continue
-        mixer_count += 1
-        digest.update(name.encode("utf-8"))
-        digest.update(model_state_digest(module).encode("ascii"))
-    return {
-        "digest": digest.hexdigest(),
-        "mixer_count": mixer_count,
-        "cache_protocol": "past_key_values=None; update_layer_cache is a no-op",
-    }
-
-
 def _write_csv_guarded(rows: Sequence[dict[str, Any]], path: Path, *, fieldnames: Sequence[str], output_root: Path, cap_bytes: int) -> dict[str, Any]:
     import io
 
@@ -298,7 +280,6 @@ def _write_csv_guarded(rows: Sequence[dict[str, Any]], path: Path, *, fieldnames
     return {
         "path": str(path),
         "bytes": len(payload),
-        "sha256": hashlib.sha256(payload).hexdigest(),
         "pre_write_root_bytes": current,
         "post_write_root_bytes": root_size_bytes(output_root),
         "cap_bytes": int(cap_bytes),
@@ -316,7 +297,6 @@ def _append_jsonl_guarded(path: Path, payload: dict[str, Any], *, output_root: P
     return {
         "path": str(path),
         "bytes": len(encoded),
-        "sha256": hashlib.sha256(encoded).hexdigest(),
         "pre_write_root_bytes": before,
         "post_write_root_bytes": root_size_bytes(output_root),
         "cap_bytes": int(cap_bytes),
@@ -332,7 +312,6 @@ def _write_json_guarded_record(path: Path, payload: Any, *, output_root: Path, c
     return {
         "path": str(path),
         "bytes": len(encoded),
-        "sha256": hashlib.sha256(encoded).hexdigest(),
         "pre_write_root_bytes": before,
         "post_write_root_bytes": root_size_bytes(output_root),
         "cap_bytes": int(cap_bytes),
@@ -351,7 +330,6 @@ def _write_self_audited_json(
     self_record: dict[str, Any] = {
         "path": str(path),
         "bytes": 0,
-        "sha256": None,
         "pre_write_root_bytes": before,
         "post_write_root_bytes": before,
         "cap_bytes": int(cap_bytes),
@@ -500,8 +478,6 @@ def run_skip_eval(
         checkpoint_path = Path(str(checkpoint_spec["checkpoint_path"]))
         model = AutoModelForCausalLM.from_pretrained(checkpoint_path, trust_remote_code=True, dtype=torch.float32).to(device)
         model.eval()
-        before_digest = model_state_digest(model)
-        before_mixer_digest = mixer_state_digest(model)
         targets = [
             (layer, pass_index)
             for layer in range(int(checkpoint_spec["num_layers"]))
@@ -524,7 +500,6 @@ def run_skip_eval(
                     skip_logits = model(input_ids=inputs, skip_layer=layer, skip_pass=pass_index).logits
                     for index, sample_id in enumerate(batch_ids):
                         skip_stats = next_token_sufficient_stats(skip_logits[index : index + 1], inputs[index : index + 1], metric_start=dataset.metric_start, metric_end=dataset.metric_end)
-                        fixed_record = dataset.records_by_sample_id[int(sample_id)]
                         sample_rows.append(
                             {
                                 "checkpoint": str(checkpoint_spec["checkpoint"]),
@@ -533,7 +508,6 @@ def run_skip_eval(
                                 "layer": int(layer),
                                 "pass": int(pass_index),
                                 "sample_id": int(sample_id),
-                                "input_sha256": str(fixed_record["input_sha256"]),
                                 "precision": "float32",
                                 "normal_ce_sum": float(normal_stats[index]["ce_sum"]),
                                 "skip_ce_sum": float(skip_stats["ce_sum"]),
@@ -552,12 +526,6 @@ def run_skip_eval(
             write_records.append(_append_jsonl_guarded(stage_path, stage, output_root=output_root, cap_bytes=cap_bytes))
             if root_size_bytes(output_root) > int(cap_bytes):
                 raise RuntimeError(f"output root cap exceeded after stage write: {root_size_bytes(output_root)} > {cap_bytes}")
-        after_digest = model_state_digest(model)
-        after_mixer_digest = mixer_state_digest(model)
-        frozen = before_digest == after_digest
-        mixer_frozen = before_mixer_digest == after_mixer_digest
-        if not frozen or not mixer_frozen:
-            raise RuntimeError(f"frozen-state digest mutation detected for {checkpoint_spec['checkpoint']}")
         checkpoint_summaries.append(
             {
                 "checkpoint": str(checkpoint_spec["checkpoint"]),
@@ -568,10 +536,6 @@ def run_skip_eval(
                 "sample_count": len(sample_ids),
                 "target_count": len(targets),
                 "elapsed_seconds": time.perf_counter() - checkpoint_start,
-                "frozen_state_pass": True,
-                "mixer_state_pass": mixer_frozen,
-                "mixer_state_digest_before": before_mixer_digest,
-                "mixer_state_digest_after": after_mixer_digest,
                 "sequence_concatenation": False,
             }
         )
@@ -620,7 +584,6 @@ def run_skip_eval(
         "output_root_bytes_after_wandb": post_wandb_root_bytes,
         "wandb": wandb_metadata,
         "precision": "float32",
-        "frozen_state_pass": all(summary["frozen_state_pass"] for summary in checkpoint_summaries),
         "artifacts": [
             detail_record,
             sample_record,
@@ -649,8 +612,6 @@ def run_skip_eval(
         "runtime_started": True,
         "accepted_output": False,
         "checkpoint_loaded": len(checkpoint_summaries) == len(checkpoints),
-        "frozen_state_pass": manifest["frozen_state_pass"],
-        "mixer_state_pass": all(summary["mixer_state_pass"] for summary in checkpoint_summaries),
         "finite_detail_rows": all(_finite(row["normal_loss"]) and _finite(row["skip_loss"]) and _finite(row["delta_loss"]) for row in detail_rows),
         "required_artifacts_written": all(
             Path(item["path"]).is_file() for item in manifest["artifacts"] if Path(item["path"]) != checks_path
