@@ -41,7 +41,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest"]
-eval = ["lm-eval>=0.4.9", "matplotlib>=3.8,<4"]
+eval = ["lm-eval>=0.4.9", "matplotlib>=3.8,<4", "pillow"]
 
 [project.urls]
 Homepage = "https://github.com/ruhai-lin/MixerLoop"
