@@ -9,7 +9,9 @@ Reproducible analyses and figures for the paper. Contributors and agents should 
 | 1: Bandwidth | When does extra recurrent compute become visible in decode throughput? | [exp1_bandwidth.py](exp1_bandwidth.py) | [exp1_bandwidth.md](exp1_bandwidth.md) |
 | 2: Memory wall | How do active FFN traffic and mixer compute differ across architectures? | [exp2_memory_wall.py](exp2_memory_wall.py) | [exp2_memory_wall.md](exp2_memory_wall.md) |
 | 3: Language modeling | How do the training-loss trajectories compare across model variants? | [exp3_language_modeling.py](exp3_language_modeling.py) | [exp3_language_modeling.md](exp3_language_modeling.md) |
-| 4: Mechanism diagnostics | How do repeated mixer updates change quality and FFN-input representations? | [exp4_mechanism_diagnostics.py](exp4_mechanism_diagnostics.py) | [exp4_mechanism_diagnostics.md](exp4_mechanism_diagnostics.md) |
+| 4: Loop quality | How does inference loop count change fixed-checkpoint prediction quality? | [exp4_loop_quality.py](exp4_loop_quality.py) | [exp4_loop_quality.md](exp4_loop_quality.md) |
+| 5: Representation rank | Where does effective rank change between one and four loops? | [exp5_representation_rank.py](exp5_representation_rank.py) | [exp5_representation_rank.md](exp5_representation_rank.md) |
+| 6: FFN input statistics | How do energy concentration and pairwise cosine change at the FFN input? | [exp6_ffn_input.py](exp6_ffn_input.py) | [exp6_ffn_input.md](exp6_ffn_input.md) |
 
 Use Python with NumPy and Matplotlib. Run from the repository root:
 
@@ -17,7 +19,9 @@ Use Python with NumPy and Matplotlib. Run from the repository root:
 python3 experiments/exp1_bandwidth.py
 python3 experiments/exp2_memory_wall.py
 python3 experiments/exp3_language_modeling.py
-python3 experiments/exp4_mechanism_diagnostics.py
+python3 experiments/exp4_loop_quality.py
+python3 experiments/exp5_representation_rank.py
+python3 experiments/exp6_ffn_input.py
 ```
 
 The scripts run offline and resolve paths relative to `Path(__file__).resolve().parent`.
@@ -33,17 +37,20 @@ experiments/
 ├── exp2_memory_wall.md
 ├── exp3_language_modeling.py
 ├── exp3_language_modeling.md
-├── exp4_mechanism_diagnostics.py
-├── exp4_mechanism_diagnostics.md
+├── exp4_loop_quality.py
+├── exp4_loop_quality.md
+├── exp5_representation_rank.py
+├── exp5_representation_rank.md
+├── exp6_ffn_input.py
+├── exp6_ffn_input.md
 ├── data/                       # Version-controlled inputs
 │   ├── exp1_bandwidth.csv
 │   ├── exp3_loss.csv
-│   └── exp4_mechanism/         # Compact four-pair mechanism inputs
-│       ├── quality.csv
-│       ├── comparisons.csv
-│       ├── performance_link.csv
-│       ├── a4_rank_differences.csv
-│       └── a5_ffn_input_differences.csv
+│   ├── exp4_loop_quality.csv
+│   ├── exp4_loop_differences.csv
+│   ├── exp5_representation_rank.csv
+│   ├── exp6_ffn_input.csv
+│   └── mechanism_checkpoints.csv # Shared checkpoint metadata and summaries
 └── outputs/                    # Generated files; ignored by Git
     ├── exp1_bandwidth.pdf
     ├── exp1_bandwidth.png
@@ -57,6 +64,8 @@ Commit the script, analysis, and compact source data needed to reproduce the res
 The analysis document records the question, data provenance, units, formulas, transformations, results, and reproduction command. Record smoothing windows, excluded samples, aggregation rules, and the meaning of uncertainty bars. Identify measurements, analytical estimates, and illustrative trajectories. Preserve the numerical coordinates when changing presentation.
 
 Experiment 1's CSV contains measurement summaries. Experiment 2 reads the canonical MixerLoop configs and keeps public-model configurations with pinned sources in its registry. Experiment 3 documents its training-loss smoothing in its analysis.
+
+Experiments 4-6 preserve the contributed mechanism-analysis tables. Experiment 4 checks paired differences against curve endpoints. Experiments 5 and 6 check their detailed rows against the shared checkpoint summaries before plotting.
 
 ## Eight-color palette
 
@@ -87,7 +96,7 @@ MODEL_COLORS = {"MixerLoop": PALETTE[0], "GDN": PALETTE[1], "FullLoop": PALETTE[
 
 - **Unordered categories:** assign colors in palette order to a stable category list. Keep each category's color across related figures and subplots, even when a category is absent. Use the reserved mappings whenever MixerLoop, GDN, or FullLoop appears; assign other categories the remaining colors.
 - **Ordered values:** use a single-hue sequence for loop counts, model sizes, or bandwidth levels. Increasing values use darker shades. For green, interpolate from `#E3F2EB` to `#3AA278`. Use the light end for filled regions; keep line colors dark enough to read on white.
-- **Signed differences:** use a diverging scale centered on zero, for example coral `#D75C5D` through off-white `#F7F7F4` to green `#3AA278`. State which direction is positive and use symmetric limits when comparing signed magnitudes.
+- **Signed differences:** use periwinkle `#6667AB` through off-white `#F7F7F4` to amber `#D99532`. For annotated heatmaps, mix each endpoint with 35% white to keep the numbers legible. Center the scale on zero and use symmetric limits. Give metrics with different units their own labeled colorbars. Experiments 5 and 6 use this convention.
 - **Emphasis:** draw the primary result at full opacity. Use light fills or reduced opacity for uncertainty and supporting regions. Keep labels opaque.
 - **Dense comparisons:** pair colors with line styles or markers. Eight colors are available, but small figures usually read best with two to four main series. Use separate panels when curves overlap heavily.
 
@@ -114,6 +123,8 @@ Color alone does not distinguish every pair under color-vision deficiencies. In 
 | Starting margins | left 0.18, right 0.94, bottom 0.20, top 0.85 |
 
 Use a short title and axis labels with explicit units. Show enough ticks to read the scale without crowding. Keep methodological details in the experiment document or paper caption. Larger multi-panel figures can use more space while preserving these font sizes at their final publication size.
+
+For multi-panel comparisons, use `ax.set_box_aspect(1)` for each plot. Experiment 4 combines model sizes in three panels on a 7.2 × 3.2 inch page; its 13M line and envelope show the seed mean and min-max range. Tabular heatmaps may retain rectangular cells: experiment 5 uses 5.4 × 3.6 inches. Experiment 6 imports experiment 5's drawing functions to produce the combined `exp5_6_rank_ffn_input` figure at 8.4 × 3.6 inches, with shared checkpoint rows and equal cell dimensions. Place composites at full width in the paper and check label sizes after scaling.
 
 After plotting, inspect the exported figure for excessive empty space inside the axes and around the panel. Adjust limits, legend placement, and margins so the data fills the available area comfortably, with enough room for labels and uncertainty bars. Preserve meaningful baselines and comparisons when tightening limits; bar charts normally start at zero.
 
@@ -189,5 +200,5 @@ Experiment 2 retains its existing architecture-map styling. Its layout-specific 
 2. Render the PDF and inspect it alongside the PNG at publication size. Check label clipping, overlapping text, legend placement, and line visibility.
 3. Check that titles and full panels are centered, related figures have matching dimensions, and neither the outer margins nor the data region contains excessive unused space.
 4. Verify palette assignments across figures. For crowded comparisons, inspect color-vision and grayscale previews and distinguish series with line styles or markers.
-5. Confirm the square PDF is 259.2 × 259.2 points and its PNG is 1080 × 1080 pixels. Regenerate outputs from the script after any correction.
+5. Confirm a single square figure is 259.2 × 259.2 PDF points and 1080 × 1080 PNG pixels. For composites, verify the documented page dimensions and individual panel aspect ratios. Keep heatmap cells and colorbars vector in the PDF (`rasterized=False`). Regenerate outputs after any correction.
 6. Review Git status: include scripts, analyses, and input data; keep generated outputs local.

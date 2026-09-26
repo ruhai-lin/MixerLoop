@@ -40,7 +40,7 @@ def plot_loss(rows):
     fig, ax = plt.subplots(figsize=(3.6, 3.6))
     fig.subplots_adjust(left=0.18, right=0.94, bottom=0.20, top=0.85)
     fig.suptitle("Language Modeling", x=0.5, y=0.96,
-                 fontsize=13, fontweight="semibold", color="#3AA278")
+                 fontsize=16, fontweight="semibold", color="#3AA278")
 
     for name, color, linestyle in SERIES:
         y = [float(row[name]) for row in rows]
@@ -62,7 +62,7 @@ def plot_loss(rows):
     ax.set_xticks([1, 2, 4, 6, 8, 10])
     ax.grid(color="#E8E5DE", linewidth=0.55)
     ax.set_axisbelow(True)
-    ax.legend(frameon=False, loc="upper right", fontsize=9,
+    ax.legend(frameon=False, loc="upper right", fontsize=12,
               handlelength=2.2, borderaxespad=0.3)
 
     # Center the full panel, including the space occupied by axis labels.
@@ -83,8 +83,8 @@ def plot_loss(rows):
 if __name__ == "__main__":
     plt.rcParams.update({
         "font.family": "DejaVu Sans",
-        "font.size": 9,
-        "axes.labelsize": 10,
+        "font.size": 12,
+        "axes.labelsize": 13,
         "axes.labelpad": 7,
         "text.color": "#303330",
         "axes.labelcolor": "#303330",
